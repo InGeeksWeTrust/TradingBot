@@ -1,0 +1,16 @@
+{
+    "configurations": [
+        {
+            "type": "codexm-debug",
+            "request": "launch",
+            "name": "Sample CodeXM Checker Configuration",
+            "targetedSourceFiles": [
+                "C:\\Users\\Admin.LAPTOP-GN1GG52U\\AppData\\Roaming\\BlackDuck\\cxm\\sample\\SampleSourceFile.js"
+            ],
+            "cxmFiles": [
+                "C:\\Users\\Admin.LAPTOP-GN1GG52U\\AppData\\Roaming\\BlackDuck\\cxm\\sample\\SampleChecker.cxm"
+            ],
+            "buildCommand": ""
+        }
+    ]
+}

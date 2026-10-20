@@ -1,0 +1,23 @@
+# Runs ONE trading session and exits. Started each weekday by orb-bot.timer.
+# Install (Linux / homelab):
+#   sudo cp deploy/orb-bot.service deploy/orb-bot.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orb-bot.timer
+# Credentials go in /etc/orb-bot.env (chmod 600), one per line:
+#   TOPSTEPX_USERNAME=...
+#   TOPSTEPX_API_KEY=...
+# Paper trading: add --dry-run to ExecStart. Remove it to trade the account in config.yaml.
+[Unit]
+Description=TopstepX MNQ ORB bot (one session)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orbbot
+WorkingDirectory=/opt/orb-bot
+EnvironmentFile=/etc/orb-bot.env
+ExecStart=/opt/orb-bot/.venv/bin/python -m orbbot.bot --config /opt/orb-bot/config.yaml --once --dry-run
+# If it crashes mid-session, restart it; it re-reads today's P&L so limits still hold.
+Restart=on-failure
+RestartSec=30

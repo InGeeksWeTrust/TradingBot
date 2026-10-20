@@ -1,0 +1,13 @@
+# Starts orb-bot.service Mon-Fri at 09:15 New York time. Using the New York zone means
+# daylight-saving changes are handled for you (that's 6:15 AZ in summer, 7:15 AZ in winter).
+# Check the next run:  systemctl list-timers orb-bot.timer
+[Unit]
+Description=Start the ORB bot each weekday before the 9:30 ET open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:15:00 America/New_York
+Persistent=false
+Unit=orb-bot.service
+
+[Install]
+WantedBy=timers.target
