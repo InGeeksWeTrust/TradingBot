@@ -238,7 +238,13 @@ class ORBBot:
                     continue
                 last_bar_t = b.t
                 sig = strat.on_bar(b)
-                if sig:
+                if sig and now - sig.time > timedelta(minutes=2):
+                    # Started late: this breakout happened before the bot was running. Count the
+                    # side as taken, as you would have, but don't chase it at today's price.
+                    strat.register_entry(sig.side)
+                    log.info("Skipping stale %s signal from %s ET (bot started after it)",
+                             sig.side, sig.time.astimezone(ET).strftime("%H:%M"))
+                elif sig:
                     signals.append(sig)
             if strat.or_ready and not or_logged:
                 or_logged = True
@@ -339,9 +345,13 @@ def setup_logging(log_dir: str) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles
+    except AttributeError:
+        pass
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
-    fh = logging.FileHandler(Path(log_dir) / f"orbbot-{datetime.now():%Y%m%d}.log")
+    fh = logging.FileHandler(Path(log_dir) / f"orbbot-{datetime.now():%Y%m%d}.log", encoding="utf-8")
     fh.setFormatter(fmt)
     root.handlers[:] = [sh, fh]
 

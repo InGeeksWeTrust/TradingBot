@@ -27,6 +27,17 @@ BAR_SECOND, BAR_MINUTE, BAR_HOUR, BAR_DAY = 1, 2, 3, 4
 TOKEN_MAX_AGE_S = 20 * 3600  # tokens last ~24h; refresh well before that
 
 
+LOGIN_ERRORS = {
+    1: "user not found: check TOPSTEPX_USERNAME (your TopstepX username, which may differ from your email)",
+    2: "password verification failed",
+    3: "invalid credentials: the username and API key don't match. Check both for typos or extra spaces, "
+       "or generate a new key in TopstepX > Settings > API",
+    7: "agreements not signed: log in to TopstepX/ProjectX and accept the pending agreements",
+    9: "no API subscription found: subscribe to API access in the ProjectX dashboard and link it in TopstepX",
+    10: "API key login is disabled for this user",
+}
+
+
 class ApiError(RuntimeError):
     def __init__(self, path: str, code: Any, message: Any):
         super().__init__(f"{path} failed: errorCode={code} errorMessage={message}")
@@ -54,7 +65,12 @@ class ProjectXClient:
         r.raise_for_status()
         d = r.json()
         if not d.get("success"):
-            raise ApiError("Auth/loginKey", d.get("errorCode"), d.get("errorMessage"))
+            code = d.get("errorCode")
+            hint = LOGIN_ERRORS.get(code, d.get("errorMessage") or "unknown error")
+            key = self.api_key
+            raise SystemExit(f"TopstepX login failed (code {code}): {hint}\n"
+                             f"  username used: [{self.username}]\n"
+                             f"  API key used:  {len(key)} chars, ends ...{key[-4:] if len(key) >= 4 else '?'}")
         self.s.headers["Authorization"] = f"Bearer {d['token']}"
         self._token_time = time.time()
         log.info("Authenticated to %s", self.base)

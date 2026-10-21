@@ -89,10 +89,11 @@ The shipped service has `--dry-run` (paper). Remove it from `ExecStart` when you
 **B. Always on.** Run `python -m orbbot.bot` (no `--once`) under systemd, `tmux`, or
 similar. It sleeps outside session hours and skips weekends and the holidays in `config.yaml`.
 
-**C. Windows.** Task Scheduler → Create Task → Trigger: Weekly, Mon–Fri, 6:15 AM (change to
-7:15 AM in November and back in March, since Windows uses your Arizona clock) → Action:
-`C:\path\to\orb-bot\.venv\Scripts\python.exe` with arguments `-m orbbot.bot --once --dry-run`
-and "Start in" set to the orb-bot folder. Set the two `TOPSTEPX_` variables as user
+**C. Windows (double-click).** `run-paper.bat` paper-trades today's session and
+`run-backtest.bat` runs a 30-day backtest. Both use the `.venv` inside the orb-bot folder.
+
+**D. Windows Task Scheduler.** Task Scheduler → Create Task → Trigger: Weekly, Mon–Fri, 6:15 AM (change to
+7:15 AM in November and back in March, since Windows uses your Arizona clock) → Action: `run-paper.bat`, with "Start in" set to the orb-bot folder. Set the two `TOPSTEPX_` variables as user
 environment variables. The machine must be awake.
 
 **Manual** works too: `python -m orbbot.bot --once --dry-run` any morning before the open.

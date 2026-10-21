@@ -66,11 +66,18 @@ class BotConfig:
 
     @property
     def username(self) -> str:
-        return os.environ["TOPSTEPX_USERNAME"]
+        return _env("TOPSTEPX_USERNAME")
 
     @property
     def api_key(self) -> str:
-        return os.environ["TOPSTEPX_API_KEY"]
+        return _env("TOPSTEPX_API_KEY")
+
+
+def _env(name: str) -> str:
+    v = os.environ.get(name, "").strip().strip('"').strip("'").strip()
+    if not v:
+        raise SystemExit(f"{name} is not set. Run: setx {name} \"...\" and open a NEW terminal.")
+    return v
 
 
 _TIME_FIELDS = {"or_start", "entry_cutoff", "flatten_time"}
