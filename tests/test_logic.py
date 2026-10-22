@@ -123,3 +123,37 @@ def test_backtest_stop_then_daily_loss_respected():
     tr = simulate_day(session(up + crash + down + rip), BotConfig(), SPEC, 10, slippage_ticks=1)
     assert [t.side for t in tr] == ["long", "short"]
     assert sum(t.pnl for t in tr) >= -500 - 30
+
+
+def test_skips_trade_when_profit_cap_leaves_less_than_1r():
+    sig = Signal("long", datetime.now(ET), 20048, 20040, 20000)
+    cfg = RiskConfig(max_daily_profit=750)
+    assert plan_trade(sig, cfg, SPEC, 542.6, 10) is None            # only ~$207 left: skip
+    p = plan_trade(sig, cfg, SPEC, 285.2, 10)                        # ~$465 left: trade, trimmed
+    assert p and p.reward_dollars >= p.risk_dollars
+    assert plan_trade(sig, RiskConfig(max_daily_profit=750, min_reward_r=0), SPEC, 542.6, 10)  # 0 = off
+
+
+def test_fixed_dollar_target_and_cap_skip():
+    sig = Signal("long", datetime.now(ET), 20048, 20040, 20000)
+    for stop in (75, 150, 250):
+        p = plan_trade(sig, RiskConfig(max_risk_per_trade=stop, target_usd=150, max_daily_profit=750), SPEC, 0.0, 10)
+        assert p.reward_dollars == 150 and p.risk_dollars == stop
+    cfg = RiskConfig(max_risk_per_trade=150, target_usd=150, max_daily_profit=750)
+    assert plan_trade(sig, cfg, SPEC, 600.0, 10).reward_dollars == 150   # room left: full $150 target
+    assert plan_trade(sig, cfg, SPEC, 640.0, 10) is None                  # cap would cut it: done for the day
+
+
+def test_mes_and_mgc_tiny_stop_widened_to_minimum_and_sized_down():
+    from orbbot.risk import spec_for
+    sig = Signal("long", datetime.now(ET), 6800, 6800, 6750)
+    p = plan_trade(sig, RiskConfig(max_risk_per_trade=75, target_usd=150), spec_for("MES"), 0.0, 10)
+    assert p.stop_ticks == 8 and p.risk_dollars <= 75 and p.contracts == 7
+
+
+def test_config_entry_must_be_known():
+    import pytest
+    from orbbot.config import BotConfig, validate
+    validate(BotConfig(entry="sweep"))
+    with pytest.raises(AssertionError):
+        validate(BotConfig(entry="nonsense"))

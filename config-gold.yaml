@@ -1,0 +1,52 @@
+# Gold (MGC) settings for the live bot's ORB. Use: python -m orbbot.bot --config config-gold.yaml --dry-run
+# Only run live after the research tool shows the ORB has an edge on gold.
+# ORB bot config. Credentials are NOT stored here:
+#   export TOPSTEPX_USERNAME="your TopstepX username"
+#   export TOPSTEPX_API_KEY="key generated in TopstepX > Settings > API"
+
+symbol: MGC
+account_name: ""          # leave blank on first run; the bot will list your accounts and exit
+poll_seconds: 5
+trading_days: [0, 1, 2, 3, 4]   # Mon-Fri
+holidays:                 # CME closed / early-close days to skip (add as needed)
+  - 2026-11-26            # Thanksgiving
+  - 2026-11-27            # day after Thanksgiving (early close)
+  - 2026-12-24
+  - 2026-12-25
+  - 2027-01-01
+kill_switch_file: STOP    # `touch STOP` in the working dir to flatten and halt for the day
+log_dir: logs
+journal_dir: journal      # paper.xlsx / live.xlsx / backtest.xlsx land here
+
+strategy:                 # times are US/Eastern. COMEX gold opens 8:20 ET (5:20 AZ until Nov 1, 6:20 AZ after)
+  or_start: "08:20"
+  or_minutes: 15          # 08:20-08:35 ET opening range
+  signal_tf_minutes: 5    # breakout confirmed on a 5-minute close outside the range
+  entry_cutoff: "10:30"   # no new entries after 10:30 ET
+  flatten_time: "11:00"   # force flat 11:00 ET
+  breakout_buffer_ticks: 0
+  min_range_points: 1     # gold points ($10/pt on MGC)
+  max_range_points: 60
+  max_chase_points: 0     # 0 = off
+  max_trades_per_day: 5   # one position at a time; daily limits still apply
+  one_trade_per_side: false  # allow re-entering the same direction
+  allow_long: true
+  allow_short: true
+
+risk:
+  contracts: 10           # MGC
+  max_contracts: 20
+  min_contracts: 1
+  stop_mode: dollar       # dollar = stop is always exactly max_risk_per_trade
+                          # (opposite | mid | fixed = structural stop, capped at max_risk_per_trade)
+  fixed_stop_points: 12.5
+  max_risk_per_trade: 250 # 10 MGC -> 2.5 pt stop
+  target_per_trade: 500   # 2:1 -> 10 MGC = 5.0 pt target
+  min_stop_ticks: 8
+  reward_risk: 2.0        # only used if target_per_trade is 0
+  max_daily_loss: 500
+  max_daily_profit: 750
+  min_reward_r: 1.0       # skip a trade if the $750 cap would trim its target below 1R
+  loss_buffer: 25
+  fee_per_contract_rt: 0.74   # estimate; check your MGC fee schedule
+  include_fees_in_pnl: true

@@ -1,0 +1,55 @@
+# Paper-trade the sweep + MES confirmation strategy on MNQ:
+#   python -m orbbot.bot --config config-sweep.yaml --dry-run --once
+# Copy account_name from your config.yaml.
+# ORB bot config. Credentials are NOT stored here:
+#   export TOPSTEPX_USERNAME="your TopstepX username"
+#   export TOPSTEPX_API_KEY="key generated in TopstepX > Settings > API"
+
+symbol: MNQ
+entry: sweep              # sweep reversal at prior-day / overnight highs and lows
+confirm_symbol: MES       # only trade when MES is on the same side of its VWAP
+history_days: 6
+account_name: "PRAC-V2-387652-21891938"          # leave blank on first run; the bot will list your accounts and exit
+poll_seconds: 5
+trading_days: [0, 1, 2, 3, 4]   # Mon-Fri
+holidays:                 # CME closed / early-close days to skip (add as needed)
+  - 2026-11-26            # Thanksgiving
+  - 2026-11-27            # day after Thanksgiving (early close)
+  - 2026-12-24
+  - 2026-12-25
+  - 2027-01-01
+kill_switch_file: STOP    # `touch STOP` in the working dir to flatten and halt for the day
+log_dir: logs
+journal_dir: journal      # paper.xlsx / live.xlsx / backtest.xlsx land here
+
+strategy:                 # times are US/Eastern. 09:30 ET = 6:30 AZ in summer, 7:30 AZ in winter (Nov-Mar)
+  or_start: "09:30"
+  or_minutes: 15          # 09:30-09:45 ET opening range
+  signal_tf_minutes: 5    # breakout confirmed on a 5-minute close outside the range
+  entry_cutoff: "11:00"   # no new entries after 11:00 ET
+  flatten_time: "11:55"   # force flat 11:55 ET
+  breakout_buffer_ticks: 0
+  min_range_points: 10
+  max_range_points: 150
+  max_chase_points: 0     # 0 = off
+  max_trades_per_day: 2   # (sweep takes at most 2 a day: each level once)
+  one_trade_per_side: true
+  allow_long: true
+  allow_short: true
+
+risk:
+  contracts: 10           # run with --contracts 20 (or change here) to size up
+  max_contracts: 20
+  min_contracts: 1
+  stop_mode: structural   # stop just beyond the sweep; contracts sized so risk stays $250
+  fixed_stop_points: 12.5
+  max_risk_per_trade: 250 # 10 MNQ -> 12.5 pt stop; 20 MNQ -> 6.25 pt stop
+  target_per_trade: 500   # 2:1
+  min_stop_ticks: 8
+  reward_risk: 2.0        # only used if target_per_trade is 0
+  max_daily_loss: 500
+  max_daily_profit: 750
+  min_reward_r: 1.0       # skip a trade if the $750 cap would trim its target below 1R
+  loss_buffer: 25
+  fee_per_contract_rt: 0.74   # estimate; check your fee schedule
+  include_fees_in_pnl: true

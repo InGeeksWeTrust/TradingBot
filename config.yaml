@@ -26,8 +26,8 @@ strategy:                 # times are US/Eastern. 09:30 ET = 6:30 AZ in summer, 
   min_range_points: 10
   max_range_points: 150
   max_chase_points: 0     # 0 = off
-  max_trades_per_day: 2
-  one_trade_per_side: true
+  max_trades_per_day: 5   # one position at a time; daily limits still apply
+  one_trade_per_side: false  # allow re-entering the same direction
   allow_long: true
   allow_short: true
 
@@ -39,11 +39,12 @@ risk:
                           # (opposite | mid | fixed = structural stop, capped at max_risk_per_trade)
   fixed_stop_points: 12.5
   max_risk_per_trade: 250 # 10 MNQ -> 12.5 pt stop; 20 MNQ -> 6.25 pt stop
-  target_per_trade: 550   # 10 MNQ -> 27.5 pt target; 20 MNQ -> 13.75 pt target (2.2R)
+  target_per_trade: 500   # 2:1 -> 10 MNQ = 25 pt target
   min_stop_ticks: 8
   reward_risk: 2.0        # only used if target_per_trade is 0
   max_daily_loss: 500
-  max_daily_profit: 1250
+  max_daily_profit: 750
+  min_reward_r: 1.0       # skip a trade if the $750 cap would trim its target below 1R
   loss_buffer: 25
   fee_per_contract_rt: 0.74   # estimate; check your fee schedule
   include_fees_in_pnl: true

@@ -24,6 +24,8 @@ from .paper import PaperClient
 from .risk import (ContractSpec, DailyGuard, plan_trade, realized_from_trades,
                    trading_day_start, unrealized)
 from .strategy import ET, Bar, ORBStrategy
+from .features import Features
+from .filters import ESConfirm, Filtered
 
 log = logging.getLogger("orbbot")
 
@@ -46,6 +48,7 @@ class ORBBot:
         self.open_trade: dict | None = None   # round trip being tracked for the journal
         self.account_id: int | None = None
         self.spec: ContractSpec | None = None
+        self.confirm_spec: ContractSpec | None = None
         self.done_day = None
 
     # ------------------------------------------------------------------ setup
@@ -65,15 +68,22 @@ class ORBBot:
         log.info("Using account %s (id %s, balance %s)", acct["name"], acct["id"], acct.get("balance"))
         self.resolve_contract()
 
-    def resolve_contract(self) -> None:
-        """Pick the active front-month contract (re-run each session to handle rollovers)."""
-        cs = self.api.search_contracts(self.cfg.symbol)
-        cands = [c for c in cs if c.get("activeContract") and c["name"].upper().startswith(self.cfg.symbol.upper())]
+    def _find(self, symbol: str) -> ContractSpec:
+        cs = self.api.search_contracts(symbol)
+        cands = [c for c in cs if c.get("activeContract") and c["name"].upper().startswith(symbol.upper())]
         if not cands:
-            raise SystemExit(f"No active contract found for {self.cfg.symbol}: {[c['name'] for c in cs]}")
+            raise SystemExit(f"No active contract found for {symbol}: {[c['name'] for c in cs]}")
         c = cands[0]
-        self.spec = ContractSpec(c["id"], float(c["tickSize"]), float(c["tickValue"]))
-        log.info("Contract %s (%s) tick %.2f = $%.2f", c["name"], c["id"], self.spec.tick_size, self.spec.tick_value)
+        log.info("Contract %s (%s) tick %.2f = $%.2f", c["name"], c["id"], float(c["tickSize"]), float(c["tickValue"]))
+        return ContractSpec(c["id"], float(c["tickSize"]), float(c["tickValue"]))
+
+    def resolve_contract(self) -> None:
+        """Pick the active front-month contract(s) (re-run each session to handle rollovers)."""
+        self.spec = self._find(self.cfg.symbol)
+        if self.cfg.entry == "sweep" and self.cfg.confirm_symbol:
+            self.confirm_spec = self._find(self.cfg.confirm_symbol)
+        if isinstance(self.api, PaperClient):
+            self.api.set_contract(self.spec.contract_id, self.spec.tick_size, self.spec.point_value)
 
     # ------------------------------------------------------------- broker ops
     def position(self) -> dict | None:
@@ -192,16 +202,57 @@ class ORBBot:
             log.info("Idle. Next session check at %s ET", nxt.strftime("%a %Y-%m-%d %H:%M"))
             time.sleep(min(max((nxt - now_et()).total_seconds(), 5), 900))
 
+    def _session(self):
+        from .research import COMEX, NASDAQ, SESSION_FOR_SYMBOL, SESSIONS
+        return SESSIONS[SESSION_FOR_SYMBOL.get(self.cfg.symbol.upper(), "nasdaq")]
+
+    def _bars(self, contract_id, start, end, partial=False) -> list[Bar]:
+        raw = self.api.retrieve_bars(contract_id, start, end, include_partial=partial)
+        return sorted((Bar.from_api(b) for b in raw), key=lambda b: b.t)
+
+    def build_sweep(self, day):
+        """Sweep entry with prior-day / overnight levels from recent history, plus optional
+        confirmation that the second market is on the trade's side of its VWAP."""
+        from .research import Sweep
+        session = self._session()
+        now = now_et()
+        hist = self._bars(self.spec.contract_id, now - timedelta(days=self.cfg.history_days), now)
+        feats = Features(hist, session.open, session.close)
+        lv = feats.day_levels(day)
+        log.info("Sweep levels: prior-day high %s low %s | overnight high %s low %s",
+                 lv.pdh, lv.pdl, lv.onh, lv.onl)
+        strat = Sweep(self.cfg.strategy, self.spec.tick_size, feats, window="am", session=session)
+        strat.reset(day)
+        if self.confirm_spec:
+            return Filtered(strat, [lambda sig: self.confirm is not None and self.confirm.check(sig.side, sig.time)])
+        return strat
+
+    def refresh_confirm(self, day) -> None:
+        if not self.confirm_spec:
+            return
+        session = self._session()
+        start = datetime.combine(day, session.open, ET)
+        now = now_et()
+        done = [b for b in self._bars(self.confirm_spec.contract_id, start, now)
+                if b.t + timedelta(minutes=1) <= now]
+        self.confirm = ESConfirm(done, session.open, session.close)
+
     def run_session(self, day) -> None:
         cfg, s = self.cfg, self.cfg.strategy
         self.resolve_contract()
-        strat = ORBStrategy(s, self.spec.tick_size)
-        strat.reset(day)
+        self.confirm = None
+        if cfg.entry == "orb":
+            strat = ORBStrategy(s, self.spec.tick_size)
+            strat.reset(day)
+        else:
+            strat = None  # built once the session opens (levels need the overnight bars)
+            sweep_ready_at = datetime.combine(day, self._session().open, ET) + timedelta(minutes=1)
         guard = DailyGuard(cfg.risk)
         realized = self.realized()
         flatten_at = datetime.combine(day, s.flatten_time, ET)
-        log.info("=== Session %s | contracts=%d | realized so far $%.2f | mode=%s ===",
-                 day, self.contracts, realized, self.mode)
+        log.info("=== Session %s | %s %s | contracts=%d | realized so far $%.2f | mode=%s ===",
+                 day, cfg.symbol, cfg.entry + (f" + {cfg.confirm_symbol} confirm" if self.confirm_spec else ""),
+                 self.contracts, realized, self.mode)
 
         pos = self.position()
         if pos:
@@ -223,15 +274,23 @@ class ORBBot:
                 log.warning("Kill switch active — halting for the day")
                 return
 
+            # --- sweep: build the strategy at the open, refresh the confirmation market
+            if cfg.entry == "sweep":
+                if strat is None and now >= sweep_ready_at:
+                    strat = self.build_sweep(day)
+                if strat is not None:
+                    self.refresh_confirm(day)
+
             # --- market data: completed 1m bars (+ partial for last price)
-            start = last_bar_t + timedelta(minutes=1) if last_bar_t else datetime.combine(day, s.or_start, ET) - timedelta(minutes=1)
+            first = datetime.combine(day, self._session().open if cfg.entry == "sweep" else s.or_start, ET)
+            start = last_bar_t + timedelta(minutes=1) if last_bar_t else first - timedelta(minutes=1)
             raw = self.api.retrieve_bars(self.spec.contract_id, start, now + timedelta(minutes=1),
                                          include_partial=True)
             bars = sorted((Bar.from_api(b) for b in raw), key=lambda b: b.t)
             cur_minute = now.replace(second=0, microsecond=0)
             last_price = bars[-1].c if bars else None
             signals = []
-            for b in bars:
+            for b in (bars if strat is not None else []):
                 if b.t.astimezone(ET) >= cur_minute:
                     continue  # still forming
                 if last_bar_t and b.t <= last_bar_t:
@@ -246,7 +305,7 @@ class ORBBot:
                              sig.side, sig.time.astimezone(ET).strftime("%H:%M"))
                 elif sig:
                     signals.append(sig)
-            if strat.or_ready and not or_logged:
+            if isinstance(strat, ORBStrategy) and strat.or_ready and not or_logged:
                 or_logged = True
                 if strat.day_disabled:
                     log.info("No trading today: %s", strat.disabled_reason)
@@ -314,7 +373,7 @@ class ORBBot:
                     log.info("%s signal skipped: no size fits remaining risk (realized $%.2f)", sig.side, realized)
                     continue
                 sl, tp = plan.bracket_ticks()
-                log.info("SIGNAL %s @ %.2f | OR %.2f-%.2f | %d ct | stop %.2f pts ($%.0f) | target %.2f pts ($%.0f) %s",
+                log.info("SIGNAL %s @ %.2f | ref %.2f-%.2f | %d ct | stop %.2f pts ($%.0f) | target %.2f pts ($%.0f) %s",
                          sig.side.upper(), sig.price, sig.or_low, sig.or_high, plan.contracts,
                          plan.stop_points, plan.risk_dollars, plan.target_points, plan.reward_dollars,
                          f"[{plan.note}]" if plan.note else "")
@@ -323,7 +382,7 @@ class ORBBot:
                 day_start = trading_day_start(datetime.now(timezone.utc))
                 self.open_trade = {"day": day, "side": sig.side, "plan": plan, "start": day_start,
                                    "seen": {f["id"] for f in self.api.search_trades(self.account_id, day_start)}}
-                tag = f"orb-{day:%Y%m%d}-{sig.side}-{uuid.uuid4().hex[:8]}"
+                tag = f"{cfg.entry}-{day:%Y%m%d}-{sig.side}-{uuid.uuid4().hex[:8]}"
                 try:
                     oid = self.api.place_order(self.account_id, self.spec.contract_id, ORDER_MARKET,
                                                SIDE_BUY if sig.side == "long" else SIDE_SELL, plan.contracts,
@@ -357,7 +416,7 @@ def setup_logging(log_dir: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="TopstepX MNQ opening range breakout bot")
+    ap = argparse.ArgumentParser(description="TopstepX futures bot (ORB or sweep entries)")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--dry-run", action="store_true", help="paper trade: live data, simulated fills, no orders sent")
     ap.add_argument("--once", action="store_true", help="run today's session if there is one, then exit")

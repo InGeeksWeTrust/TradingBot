@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from .config import BotConfig, load_config
 from .journal import build_workbook
-from .risk import ContractSpec, plan_trade
+from .risk import RANGE_FILTER, ContractSpec, plan_trade, spec_for
 from .strategy import ET, Bar, ORBStrategy
 
 
@@ -41,15 +41,20 @@ class Trade:
     stop_pts: float = 0.0
     target_pts: float = 0.0
     risk_usd: float = 0.0
+    entry_i: int = -1      # index of the entry bar within the day's bars (research tool)
+    partial_pts: float = 0.0  # partial take-profit distance (0 = none)
+    n_part: int = 0           # contracts taken off at the partial
 
 
 def simulate_day(bars: list[Bar], cfg: BotConfig, spec: ContractSpec, contracts: int,
-                 slippage_ticks: int = 1) -> list[Trade]:
-    s, r = cfg.strategy, cfg.risk
+                 slippage_ticks: int = 1, strat=None, risk=None) -> list[Trade]:
+    """`strat` is any entry rule with reset(day), on_bar(bar) -> Signal | None and
+    register_entry(side); default is the ORB. `risk` overrides cfg.risk."""
+    s, r = cfg.strategy, (risk or cfg.risk)
     tick, pv = spec.tick_size, spec.point_value
     slip = slippage_ticks * tick
     fee = r.fee_per_contract_rt if r.include_fees_in_pnl else 0.0
-    strat = ORBStrategy(s, tick)
+    strat = strat or ORBStrategy(s, tick)
     day = bars[0].t.astimezone(ET).date()
     strat.reset(day)
     flatten_at = datetime.combine(day, s.flatten_time, ET)
@@ -65,12 +70,16 @@ def simulate_day(bars: list[Bar], cfg: BotConfig, spec: ContractSpec, contracts:
         sign = 1 if pos["side"] == "long" else -1
         pnl = (price - pos["entry"]) * sign * pos["n"] * pv - fee * pos["n"]
         realized += pnl
-        trades.append(Trade(str(day), pos["side"], pos["n"], pos["time"].astimezone(ET).strftime("%H:%M"),
-                            pos["entry"], b.t.astimezone(ET).strftime("%H:%M"), round(price, 2), reason, round(pnl, 2),
-                            pos["plan"].stop_points, pos["plan"].target_points, round(pos["plan"].risk_dollars, 2)))
+        total = pnl + pos.get("booked", 0.0)
+        if pos.get("booked_n"):
+            reason = f"partial+{reason}"
+        trades.append(Trade(str(day), pos["side"], pos.get("n0", pos["n"]), pos["time"].astimezone(ET).strftime("%H:%M"),
+                            pos["entry"], b.t.astimezone(ET).strftime("%H:%M"), round(price, 2), reason, round(total, 2),
+                            pos["plan"].stop_points, pos["plan"].target_points, round(pos["plan"].risk_dollars, 2),
+                            pos["i"], pos.get("partial_pts", 0.0), pos.get("n_part", 0)))
         pos = None
 
-    for b in bars:
+    for i, b in enumerate(bars):
         t = b.t.astimezone(ET)
         if t >= flatten_at:
             if pos:
@@ -83,7 +92,14 @@ def simulate_day(bars: list[Bar], cfg: BotConfig, spec: ContractSpec, contracts:
             px = b.o + slip if p.side == "long" else b.o - slip
             stop = px - p.stop_points if p.side == "long" else px + p.stop_points
             tgt = px + p.target_points if p.side == "long" else px - p.target_points
-            pos = {"side": p.side, "n": p.contracts, "entry": px, "stop": stop, "target": tgt, "time": b.t, "plan": p}
+            pos = {"side": p.side, "n": p.contracts, "entry": px, "stop": stop, "target": tgt, "time": b.t, "plan": p, "i": i}
+            if r.partial_r > 0:
+                ppts = p.stop_points * r.partial_r
+                plvl = px + ppts if p.side == "long" else px - ppts
+                if p.contracts >= 2:   # half off at the partial, runner to the full target
+                    pos.update(partial=plvl, partial_pts=ppts, n_part=p.contracts // 2, n0=p.contracts)
+                else:                  # a single contract can't be split: it all exits at the partial
+                    pos.update(target=plvl, partial_pts=0.0)
         pending_plan = None
 
         if pos:
@@ -104,6 +120,12 @@ def simulate_day(bars: list[Bar], cfg: BotConfig, spec: ContractSpec, contracts:
                 if loss_hit and (not stop_hit or abs(loss_lvl - pos["entry"]) < abs(pos["stop"] - pos["entry"])):
                     lvl, why = loss_lvl, "daily_loss"
                 close(b, lvl - sign * slip, why)
+            elif pos.get("partial") is not None and (
+                    (favorable >= pos["partial"]) if long else (favorable <= pos["partial"])):
+                k = pos["n_part"]  # bank half, stop to breakeven, let the rest run
+                booked = (pos["partial"] - pos["entry"]) * sign * k * pv - fee * k
+                realized += booked
+                pos.update(booked=booked, booked_n=k, n=pos["n"] - k, partial=None, stop=pos["entry"])
             elif tgt_hit or prof_hit:
                 lvl, why = (pos["target"], "target")
                 if prof_hit and (not tgt_hit or abs(prof_lvl - pos["entry"]) < abs(pos["target"] - pos["entry"])):
@@ -124,14 +146,63 @@ def simulate_day(bars: list[Bar], cfg: BotConfig, spec: ContractSpec, contracts:
     return trades
 
 
-def load_csv(path: str) -> list[Bar]:
-    out = []
-    with open(path) as f:
-        for row in csv.DictReader(f):
-            t = datetime.fromisoformat(row["t"].replace("Z", "+00:00"))
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            out.append(Bar(t, float(row["o"]), float(row["h"]), float(row["l"]), float(row["c"]), float(row.get("v") or 0)))
+_ALIASES = {
+    "t": ["t", "time", "timestamp", "datetime", "date_time", "ts_event", "ts", "date"],
+    "o": ["o", "open"], "h": ["h", "high"], "l": ["l", "low"], "c": ["c", "close", "last"],
+    "v": ["v", "volume", "vol"],
+}
+
+
+def _parse_time(raw: str, assume_tz) -> datetime:
+    raw = raw.strip()
+    if raw.isdigit():  # epoch: seconds, ms or ns
+        n = int(raw)
+        sec = n / 1e9 if n > 1e17 else n / 1e3 if n > 1e11 else n
+        return datetime.fromtimestamp(sec, timezone.utc)
+    raw = raw.replace("Z", "+00:00")
+    if "." in raw and "+" in raw:  # trim nanoseconds (Python handles up to microseconds)
+        head, tz = raw.rsplit("+", 1)
+        base, frac = head.split(".", 1)
+        raw = f"{base}.{frac[:6]}+{tz}"
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+                "%Y%m%d %H%M%S", "%Y%m%d %H:%M:%S"):
+        try:
+            t = datetime.fromisoformat(raw) if fmt is None else datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f"Unrecognised timestamp: {raw!r}")
+    return t if t.tzinfo else t.replace(tzinfo=assume_tz)
+
+
+def load_csv(path: str, tz: str = "UTC") -> list[Bar]:
+    """Load 1-minute OHLCV bars. Accepts common vendor layouts: t/o/h/l/c/v, Time/Open/High/...,
+    Databento ts_event, or separate Date and Time columns. Timestamps without an offset are taken
+    to be in `tz` (e.g. America/New_York for exchange-time exports). Bar time = bar OPEN time."""
+    from zoneinfo import ZoneInfo
+    assume = ZoneInfo(tz)
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rd = csv.DictReader(f)
+        lower = {h.lower().strip(): h for h in rd.fieldnames or []}
+        col = {}
+        for k, names in _ALIASES.items():
+            col[k] = next((lower[n] for n in names if n in lower), None)
+        date_col, time_col = lower.get("date"), lower.get("time")
+        split_dt = date_col and time_col
+        missing = [k for k in "ohlc" if not col[k]] + ([] if (col["t"] or split_dt) else ["time"])
+        if missing:
+            raise SystemExit(f"{path}: can't find column(s) {missing}. Columns present: {rd.fieldnames}")
+        out = []
+        for row in rd:
+            raw_t = f"{row[date_col]} {row[time_col]}" if split_dt else row[col["t"]]
+            out.append(Bar(_parse_time(raw_t, assume), float(row[col["o"]]), float(row[col["h"]]),
+                           float(row[col["l"]]), float(row[col["c"]]),
+                           float(row[col["v"]] or 0) if col["v"] else 0.0))
+    out.sort(key=lambda b: b.t)
+    if not out:
+        raise SystemExit(f"{path}: no rows")
+    print(f"Loaded {len(out)} bars from {path}: {out[0].t.astimezone(ET):%Y-%m-%d} to {out[-1].t.astimezone(ET):%Y-%m-%d} (ET)")
     return out
 
 
@@ -151,7 +222,7 @@ def fetch_bars(cfg: BotConfig, days: int) -> tuple[list[Bar], ContractSpec]:
             bars[b.t] = b
         cur = nxt
     print(f"Fetched {len(bars)} bars for {bot.spec.contract_id}. NOTE: only the current contract month;"
-          " for longer tests export continuous data to CSV.")
+          " for longer tests run `python -m orbbot.history --months 12`.")
     return [bars[k] for k in sorted(bars)], bot.spec
 
 
@@ -197,21 +268,52 @@ def report(trades: list[Trade], n_days: int) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--csv")
+    ap.add_argument("--csv", help="1-minute OHLCV file, e.g. data/mnq_1m.csv from `python -m orbbot.history`")
+    ap.add_argument("--csv-tz", default="UTC", help="time zone for CSV timestamps that have no offset "
+                    "(e.g. America/New_York or America/Chicago)")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--contracts", type=int)
+    ap.add_argument("--symbol", help="instrument for CSV data: MNQ, MES, NQ, ES, MGC, GC (default: symbol in config)")
+    ap.add_argument("--max-trades", type=int, help="override max_trades_per_day")
+    ap.add_argument("--one-per-side", choices=["yes", "no"], help="override one_trade_per_side")
+    ap.add_argument("--profit-cap", type=float, help="override max_daily_profit ($)")
+    ap.add_argument("--loss-limit", type=float, help="override max_daily_loss ($)")
+    ap.add_argument("--target-usd", type=float, help="take profit at this many $ on every trade")
+    ap.add_argument("--stop-usd", type=float, help="override max_risk_per_trade ($)")
     ap.add_argument("--slippage", type=int, default=1, help="ticks of slippage on entries and stops")
     ap.add_argument("--out", default="journal/backtest.xlsx", help="Excel workbook to write")
     a = ap.parse_args()
     cfg = load_config(a.config)
+    import dataclasses
+    st, rk = cfg.strategy, cfg.risk
+    if a.max_trades is not None:
+        st = dataclasses.replace(st, max_trades_per_day=a.max_trades)
+    if a.one_per_side:
+        st = dataclasses.replace(st, one_trade_per_side=a.one_per_side == "yes")
+    if a.profit_cap is not None:
+        rk = dataclasses.replace(rk, max_daily_profit=a.profit_cap)
+    if a.loss_limit is not None:
+        rk = dataclasses.replace(rk, max_daily_loss=a.loss_limit)
+    if a.target_usd is not None:
+        rk = dataclasses.replace(rk, target_usd=a.target_usd)
+    if a.stop_usd is not None:
+        rk = dataclasses.replace(rk, max_risk_per_trade=a.stop_usd)
+    sym = (a.symbol or cfg.symbol).upper()
+    if sym in RANGE_FILTER and sym != cfg.symbol.upper():
+        lo, hi = RANGE_FILTER[sym]  # config's range filter is for a different market
+        st = dataclasses.replace(st, min_range_points=lo, max_range_points=hi)
+    cfg = dataclasses.replace(cfg, strategy=st, risk=rk)
+    print(f"Settings: {st.max_trades_per_day} trades/day, one per side: {st.one_trade_per_side}, "
+          f"daily loss ${rk.max_daily_loss:,.0f}, profit cap ${rk.max_daily_profit:,.0f}, "
+          f"{st.or_start:%H:%M}-{st.entry_cutoff:%H:%M} ET entries, flat {st.flatten_time:%H:%M}")
     if a.csv:
-        bars, spec = load_csv(a.csv), ContractSpec("CSV")
+        bars, spec = load_csv(a.csv, a.csv_tz), spec_for(a.symbol or cfg.symbol)
     else:
         bars, spec = fetch_bars(cfg, a.days)
     n = a.contracts or cfg.risk.contracts
     trades = run(bars, cfg, spec, n, a.slippage)
     n_days = len({b.t.astimezone(ET).date() for b in bars if b.t.astimezone(ET).weekday() < 5})
-    print(f"\nORB backtest | {n} contracts | {cfg.symbol}\n" + report(trades, n_days))
+    print(f"\nORB backtest | {n} contracts | {spec.contract_id if a.csv else cfg.symbol}\n" + report(trades, n_days))
     rows = [{"date": t.day, "mode": "backtest", "side": t.side, "contracts": t.contracts,
              "entry_time": t.entry_time, "entry": round(t.entry, 2), "exit_time": t.exit_time, "exit": t.exit,
              "reason": t.reason, "stop_pts": t.stop_pts, "target_pts": t.target_pts,

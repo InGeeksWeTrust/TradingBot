@@ -114,6 +114,117 @@ Because backtest, paper and live write the same layout, you can put them side by
 whether live behaves like the backtest. If a workbook is open in Excel when a trade closes,
 the CSV still updates and the workbook is retried every poll, so it catches up once you close it.
 
+## Historical data for backtesting
+
+TopstepX only serves the current contract (about 6 weeks), and TradingView caps intraday bars,
+so a year of history comes from Databento (CME's own data, pay per download):
+
+```powershell
+python -m pip install databento
+setx DATABENTO_API_KEY "db-..."              # databento.com > API keys; then open a NEW terminal
+python -m orbbot.databento_fetch --months 12 # shows the price and asks before buying
+python -m orbbot.backtest --csv data\mnq_databento.csv
+```
+Downloads are cached in `data\` (`.dbn.zst`), so re-running the same range costs nothing.
+`python -m orbbot.history` pulls what TopstepX has, free; any vendor CSV also works with `--csv`.
+
+## Comparing entry ideas
+
+```powershell
+# one-time, free: rebuild all 23 hours from the Databento file you already bought
+python -m orbbot.databento_fetch --from-cache data\MNQ_v_0_2025-10-20_2026-10-21.dbn.zst --all-hours --out data\mnq_all.csv
+
+python -m orbbot.research --csv data\mnq_all.csv
+```
+Tests the multi-timeframe trend idea (`mtf`) and three reversal ideas (`sweep`, `vwapband`,
+`gapfade`) against the current `orb`, at 1R / 1.5R / 2.2R targets. Each variant is run on the
+older 8 months (TRAIN) and the last 4 months (TEST) and compared with random long/short entries
+at the same moments (`p(random)`). A variant is flagged only if, in every period, it beats random
+(p < 0.02), is profitable, and keeps drawdown under $2,000. Full table: `journal\research.xlsx`.
+
+Final check on data never used for choosing (for example an extra Databento year):
+```powershell
+python -m orbbot.research --csv data\mnq_2025.csv --holdout --only "mtf day struct 2.2R 10ct"
+```
+`python -m orbbot.research --help` lists all options; `python -m orbbot.research --strategies orb_first fade pullback`
+re-runs the earlier ideas.
+
+## Filters: volume, news days, ES confirmation (all trades 2:1)
+
+```powershell
+python -m orbbot.databento_fetch --months 12 --symbol ES.v.0 --all-hours --out data\es_all.csv
+python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv
+python -m orbbot.research --csv data\gold_all.csv --symbol MGC
+```
+Every idea is run plain and with each filter: `rvol` (busy open: first-5-minute volume >= 1.5x
+the 20-session average), `news` (skip days where 8:30-8:45 ET moved > 2.5x normal), `es` (ES on
+the trade's side of its VWAP; MNQ only) and `all`. Targets default to 2:1 (`--r`).
+
+## CRT (Candle Range Theory)
+
+```powershell
+python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv --strategies crt1h_mid crt1h_range crt4h_mid crt4h_range --filters none es --out journal\crt_mnq.xlsx
+python -m orbbot.research --csv data\es_all.csv --symbol MES --confirm-csv data\mnq_all.csv --strategies crt1h_mid crt1h_range crt4h_mid crt4h_range --filters none es --out journal\crt_mes.xlsx
+python -m orbbot.research --csv data\gold_all.csv --symbol MGC --confirm-csv data\6e_all.csv --confirm-name 6e --strategies crt1h_mid crt1h_range crt4h_mid crt4h_range --filters none es --out journal\crt_mgc.xlsx
+```
+Previous 1-hour candle (or 4-hour NY block: 1, 5, 9, 13, 17, 21h) = range. The next candle sweeps
+exactly one side and closes back inside -> enter at that close, stop one tick beyond the sweep wick
+(sized to $250), target the range's 50% (`_mid`) or its far side (`_range`).
+
+## Order-block zones with partial profit + runner
+
+```powershell
+python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv --strategies zone4r zone_runner --filters none es --out journal\zone_mnq.xlsx
+python -m orbbot.research --csv data\es_all.csv --symbol MES --confirm-csv data\mnq_all.csv --strategies zone4r zone_runner --filters none es --out journal\zone_mes.xlsx
+python -m orbbot.research --csv data\gold_all.csv --symbol MGC --confirm-csv data\6e_all.csv --confirm-name 6e --strategies zone4r zone_runner --filters none es --out journal\zone_mgc.xlsx
+```
+Zone = last opposite-color 1-min candle before a 3x-ATR move within 3 bars. Price returns and a
+1-min candle closes back out of the zone in the trade direction -> enter; stop one tick beyond the
+zone or wick ($250). `zone4r`: all out at 4R. `zone_runner`: half at 4R, stop to breakeven, rest to 8R.
+
+## Paper trading the sweep strategy (live bot)
+
+`config-sweep.yaml` runs the one idea that held up best in testing: **sweep + MES confirmation on
+MNQ** (price runs through the prior-day or overnight high/low, a 5-minute bar closes back, MES is on
+the same side of its VWAP; structural stop sized to $250, 2:1 target, at most 2 trades a day).
+
+```powershell
+python -m orbbot.bot --config config-sweep.yaml --dry-run --once     # or double-click run-sweep-paper.bat
+```
+At 9:31 ET it loads ~6 days of history for the levels (logged as "Sweep levels: ..."), then watches
+MNQ and MES until 11:30 ET and is flat by 11:55. Trades go to `journal\paper.xlsx`.
+It did NOT fully pass the holdout test (p 0.03, drawdown $2,115 on 2024-25); paper results are the
+next piece of evidence, not a green light for real money.
+
+## Scalping mode: fixed $ take-profit, many trades, daily cap
+
+```powershell
+python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv --target-usd 150 --max-trades 20 --reentry --profit-cap 750 --filters none es
+python -m orbbot.research --csv data\es_all.csv --symbol MES --confirm-csv data\mnq_all.csv --target-usd 150 --max-trades 20 --reentry --profit-cap 750 --filters none es
+python -m orbbot.research --csv data\gold_all.csv --symbol MGC --confirm-csv data\6e_all.csv --confirm-name 6e --target-usd 150 --max-trades 20 --reentry --profit-cap 750 --filters none es
+```
+Every trade takes profit at `--target-usd`; stops of $75, $150 and $250 are compared (`--stops-usd`).
+After each trade the strategy may enter again (`--reentry`, up to `--max-trades`); the day ends at
+the profit cap (a trade is skipped once the cap would cut its $ target) or at -$500. The same
+settings exist in config.yaml as `target_usd` / `max_risk_per_trade` and on `orbbot.backtest`
+(`--target-usd 150 --stop-usd 150`).
+
+## Gold (MGC) at the COMEX open
+
+```powershell
+python -m orbbot.databento_fetch --months 12 --symbol GC.v.0 --all-hours --out data\gold_all.csv
+python -m orbbot.research --csv data\gold_all.csv --symbol MGC --r 2
+```
+Seven ideas run by default, including two built from the "MACD + Bollinger + VWAP on the
+5-minute" description: `bbrev` (stretch outside the band, then fading MACD -> fade it) and
+`bbmom` (MACD cross on the trend side of VWAP -> go with it). Their rules were fixed before
+any real gold data was tested.
+GC and MGC trade at the same price, so the full-size GC history (cleaner bars) is used for signals
+while P&L is figured for MGC ($10/pt). `--symbol MGC` switches every strategy to the COMEX session:
+open 8:20 ET, entries until 10:30, flat by 11:00. `config-gold.yaml` has the same settings for the
+live bot (`python -m orbbot.bot --config config-gold.yaml --dry-run`); the live bot currently
+trades the ORB rule only.
+
 ## Other commands
 
 ```bash

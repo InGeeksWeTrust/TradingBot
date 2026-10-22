@@ -43,8 +43,12 @@ class RiskConfig:
     min_stop_ticks: int = 8            # TopstepX rejects brackets of 5 ticks or fewer
     reward_risk: float = 2.0           # used only when target_per_trade is 0
     target_per_trade: float = 550.0    # $ target at full size; sets R = target / max_risk_per_trade
+    target_usd: float = 0.0            # >0: every trade takes profit at this many $, whatever its size
+    target_mode: str = "r"             # r = multiple of the stop; level = the price the strategy names
+    partial_r: float = 0.0             # >0: take half off at this many R, move stop to breakeven, run the rest
     max_daily_loss: float = 500.0
     max_daily_profit: float = 1250.0
+    min_reward_r: float = 1.0          # skip a trade if the profit cap trims its target below this many R
     loss_buffer: float = 25.0          # slippage cushion held back from the daily-loss headroom
     fee_per_contract_rt: float = 0.74  # ESTIMATE, check your TopstepX fee schedule
     include_fees_in_pnl: bool = True
@@ -53,6 +57,9 @@ class RiskConfig:
 @dataclass
 class BotConfig:
     symbol: str = "MNQ"
+    entry: str = "orb"                 # entry rule for the live bot: orb | sweep
+    confirm_symbol: str = ""           # sweep: second market that must agree (MES for MNQ); blank = off
+    history_days: int = 6              # sweep: days of 1-min history loaded for prior-day/overnight levels
     account_name: str = ""             # exact account name/id as shown in TopstepX
     base_url: str = "https://api.topstepx.com"
     poll_seconds: float = 5.0
@@ -108,7 +115,8 @@ def validate(cfg: BotConfig) -> None:
     r, s = cfg.risk, cfg.strategy
     assert 1 <= r.contracts <= r.max_contracts, "contracts must be between 1 and max_contracts"
     assert r.max_contracts <= 20, "max_contracts is capped at 20 for this bot"
-    assert r.stop_mode in {"dollar", "opposite", "mid", "fixed"}
+    assert r.stop_mode in {"dollar", "opposite", "mid", "fixed", "structural"}
     assert r.max_daily_loss > 0 and r.max_daily_profit > 0
     assert r.min_stop_ticks >= 6, "TopstepX rejects brackets of 5 ticks or fewer"
     assert s.entry_cutoff < s.flatten_time
+    assert cfg.entry in {"orb", "sweep"}, "entry must be orb or sweep"

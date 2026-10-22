@@ -1,0 +1,12 @@
+2026-10-22 06:25:42,151 INFO     Authenticated to https://api.topstepx.com
+2026-10-22 06:26:16,370 INFO     Authenticated to https://api.topstepx.com
+2026-10-22 06:26:16,442 INFO     Using account PRAC-V2-387652-21891938 (id 28771375, balance 150000.0)
+2026-10-22 06:26:16,515 INFO     Contract MNQZ6 (CON.F.US.MNQ.Z26) tick 0.25 = $0.50
+2026-10-22 06:26:16,587 INFO     Contract MESZ6 (CON.F.US.MES.Z26) tick 0.25 = $1.25
+2026-10-22 06:26:16,660 INFO     Contract MNQZ6 (CON.F.US.MNQ.Z26) tick 0.25 = $0.50
+2026-10-22 06:26:16,732 INFO     Contract MESZ6 (CON.F.US.MES.Z26) tick 0.25 = $1.25
+2026-10-22 06:26:16,755 INFO     === Session 2026-10-22 | MNQ sweep + MES confirm | contracts=10 | realized so far $0.00 | mode=paper ===
+2026-10-22 06:31:03,077 INFO     Sweep levels: prior-day high 30114.0 low 29771.25 | overnight high 29996.0 low 29416.25
+2026-10-22 08:55:04,225 INFO     === Session over. Realized $0.00 ===
+2026-10-22 08:55:04,282 INFO     Idle. Next session check at Fri 2026-10-23 09:25 ET
+2026-10-22 08:55:55,086 WARNING  Interrupted. Open positions keep their server-side brackets; flatten manually if needed.

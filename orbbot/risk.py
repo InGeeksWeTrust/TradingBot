@@ -23,6 +23,23 @@ class ContractSpec:
         return self.tick_value / self.tick_size
 
 
+# Tick size and $ per tick for CME index futures (used when backtesting from CSV files).
+SPECS = {"MNQ": (0.25, 0.50), "NQ": (0.25, 5.00), "MES": (0.25, 1.25), "ES": (0.25, 12.50),
+         "M2K": (0.10, 0.50), "MYM": (1.0, 0.50), "MGC": (0.10, 1.00), "GC": (0.10, 10.00)}
+
+
+# ORB range filter (min, max points) per market; config.yaml's 10-150 is in Nasdaq points.
+RANGE_FILTER = {"MES": (2.5, 40.0), "ES": (2.5, 40.0), "MGC": (1.0, 60.0), "GC": (1.0, 60.0)}
+
+
+def spec_for(symbol: str) -> ContractSpec:
+    root = symbol.upper().split(".")[0]
+    if root not in SPECS:
+        raise SystemExit(f"Unknown symbol {symbol}; known: {', '.join(SPECS)}")
+    tick, value = SPECS[root]
+    return ContractSpec(root, tick, value)
+
+
 @dataclass
 class TradePlan:
     side: str
@@ -55,7 +72,9 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
     # structural stop distance
     if cfg.stop_mode == "dollar":
         structural = cfg.max_risk_per_trade / (n * pv)  # exactly max_risk_per_trade at full size
-    elif cfg.stop_mode == "opposite":
+    elif cfg.stop_mode in ("opposite", "structural"):
+        # opposite: the other side of the range; structural: a level the strategy chose
+        # (passed in or_low for longs / or_high for shorts)
         structural = sig.price - sig.or_low if sig.side == "long" else sig.or_high - sig.price
     elif cfg.stop_mode == "mid":
         mid = (sig.or_high + sig.or_low) / 2
@@ -63,13 +82,20 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
     else:
         structural = cfg.fixed_stop_points
 
-    # cap the stop so the full size risks no more than max_risk_per_trade
-    cap = cfg.max_risk_per_trade / (n * pv)
-    stop = min(structural, cap)
-    if stop < structural:
-        notes.append(f"stop capped {structural:.2f}->{stop:.2f}pts")
-    stop_ticks = max(cfg.min_stop_ticks, math.floor(stop / tick + 1e-9))
-    stop = stop_ticks * tick
+    if structural <= 0:
+        return None
+    if cfg.stop_mode == "structural":
+        # keep the stop at the level; trade fewer contracts so the risk stays within budget
+        stop_ticks = max(cfg.min_stop_ticks, math.ceil(structural / tick - 1e-9))
+        stop = stop_ticks * tick
+    else:
+        # cap the stop so the full size risks no more than max_risk_per_trade
+        cap = cfg.max_risk_per_trade / (n * pv)
+        stop = min(structural, cap)
+        if stop < structural:
+            notes.append(f"stop capped {structural:.2f}->{stop:.2f}pts")
+        stop_ticks = max(cfg.min_stop_ticks, math.floor(stop / tick + 1e-9))
+        stop = stop_ticks * tick
 
     # remaining daily-loss headroom (realized is negative when losing)
     headroom = cfg.max_daily_loss + realized_pnl - cfg.loss_buffer
@@ -83,8 +109,16 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
         return None
 
     # target: R multiple, trimmed so a win doesn't overshoot the daily profit cap
-    rr = cfg.target_per_trade / cfg.max_risk_per_trade if cfg.target_per_trade > 0 else cfg.reward_risk
-    target = stop * rr
+    if cfg.target_mode == "level" and sig.target is not None:
+        target = abs(sig.target - sig.price)    # strategy's own take-profit level
+        if target <= 0:
+            return None
+    elif cfg.target_usd > 0:
+        target = cfg.target_usd / (sized * pv)  # fixed $ take-profit for the size actually traded
+    else:
+        rr = cfg.target_per_trade / cfg.max_risk_per_trade if cfg.target_per_trade > 0 else cfg.reward_risk
+        target = stop * rr
+    planned_target = target
     room = cfg.max_daily_profit - realized_pnl + cfg.fee_per_contract_rt * sized
     max_target = room / (sized * pv)
     if max_target < target:
@@ -92,6 +126,11 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
         notes.append("target trimmed to daily profit cap")
     target_ticks = max(cfg.min_stop_ticks, math.ceil(target / tick - 1e-9))
     target = target_ticks * tick
+    if cfg.target_usd > 0 or cfg.target_mode == "level":
+        if cfg.min_reward_r > 0 and target < planned_target - tick / 2:
+            return None  # fixed-$ mode: the daily cap would cut the take-profit, so stop for the day
+    elif target < stop * cfg.min_reward_r - 1e-9:
+        return None  # what's left before the daily profit cap isn't worth the risk
 
     return TradePlan(sig.side, sized, sig.price, stop, target, stop_ticks, target_ticks,
                      risk_dollars=stop * pv * sized, reward_dollars=target * pv * sized,

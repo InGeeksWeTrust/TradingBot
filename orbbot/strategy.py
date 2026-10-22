@@ -37,6 +37,7 @@ class Signal:
     price: float       # signal bar close
     or_high: float
     or_low: float
+    target: float | None = None  # optional take-profit price (level-based targets)
 
 
 class ORBStrategy:

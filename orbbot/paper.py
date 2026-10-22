@@ -35,6 +35,10 @@ class PaperClient:
         self.orders: list[dict] = []
         self.trades: list[dict] = []
         self._id = 1
+        self.watch: str | None = None  # contract whose bars drive simulated fills
+
+    def set_contract(self, contract_id: str, tick: float, point_value: float) -> None:
+        self.watch, self.tick, self.pv = contract_id, tick, point_value
 
     # ---- passthrough
     def login(self):
@@ -44,16 +48,12 @@ class PaperClient:
         return self.real.search_accounts(only_active)
 
     def search_contracts(self, text: str, live: bool = False):
-        cs = self.real.search_contracts(text, live)
-        for c in cs:
-            if c.get("activeContract"):
-                self.tick, self.pv = float(c["tickSize"]), float(c["tickValue"]) / float(c["tickSize"])
-                break
-        return cs
+        return self.real.search_contracts(text, live)
 
     def retrieve_bars(self, contract_id, start, end, **kw):
         bars = self.real.retrieve_bars(contract_id, start, end, **kw)
-        self._on_bars(sorted(bars, key=lambda b: b["t"]))
+        if self.watch is None or contract_id == self.watch:  # ignore other markets' bars
+            self._on_bars(sorted(bars, key=lambda b: b["t"]))
         return bars
 
     # ---- simulated account
