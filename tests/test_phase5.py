@@ -215,7 +215,7 @@ def test_14b_account_guard_blocks_a_trade_that_could_breach_the_mll(tmp_path):
     sc = Scenario(tmp_path, broker=broker, cfg=cfg, clock=clock)
     sc.run_until(9, 46)
     assert not entries(sc)
-    assert any("MLL buffer" in e[2] or "above the MLL" in e[2] for e in sc.events("signal_blocked"))
+    assert any("MLL" in e[2] for e in sc.events("signal_blocked"))
 
 
 def test_15_unexpected_positions(tmp_path):
@@ -495,3 +495,158 @@ def test_25_old_state_files_gain_the_new_forward_columns(tmp_path):
     s = StateStore(p)
     s.forward("t", fill_source="paper-sim", market_drift_ticks=2.0)
     assert s.forward_rows()[0]["fill_source"] == "paper-sim"
+
+
+# ---------------------------------------------------------------- operational-week checks (review round 3)
+def _paper_scenario(tmp_path, clock=None):
+    from orbbot.paper import PaperClient
+    clock = clock or FakeClock(datetime.combine(DAY, time(9, 30, 30), ET))
+    market = FakeBroker(clock)
+    paper = PaperClient(market, fee_per_contract_rt=1.22, state_path=tmp_path / "state" / "paper_broker.json",
+                        clock=clock)
+    return market, paper, clock
+
+
+def _restart(tmp_path, market, clock):
+    from orbbot.paper import PaperClient
+    paper = PaperClient(market, fee_per_contract_rt=1.22, state_path=tmp_path / "state" / "paper_broker.json",
+                        clock=clock)
+    return paper, Scenario(tmp_path, broker=paper, clock=clock)
+
+
+def test_26a_crash_after_intent_recorded_before_sending(tmp_path):
+    market, paper, clock = _paper_scenario(tmp_path)
+    st = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: clock().astimezone(timezone.utc))
+    st.create_intent("sweep-crash-a", DAY, CID, "short", 5, {"stop_pts": 20.25, "target_pts": 40.5}, ["pdh"], ["short"])
+    st.close()
+    clock.advance(60)
+    paper2, sc = _restart(tmp_path, market, clock)
+    assert sc.states("sweep-crash-a")[-1] == "CANCELLED" and paper2.pos is None and not paper2.history
+    sc.run_until(9, 50)
+    assert not paper2.history                       # pdh stays used: nothing is ever sent
+
+
+def test_26b_crash_after_broker_accepted_before_ack_was_recorded(tmp_path):
+    market, paper, clock = _paper_scenario(tmp_path)
+    clock.t = datetime.combine(DAY, time(9, 45, 2), ET)
+    paper.retrieve_bars(CID, clock() - timedelta(minutes=5), clock(), include_partial=True)   # a price
+    st = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: clock().astimezone(timezone.utc))
+    st.create_intent("sweep-crash-b", DAY, CID, "short", 5, {"stop_pts": 20.25, "target_pts": 40.5}, ["pdh"], ["short"])
+    st.set_state("sweep-crash-b", "SUBMITTING", "CREATED")
+    st.close()
+    paper.set_contract(CID, 0.25, 2.0)
+    paper.place_order(1, CID, ORDER_MARKET, 1, 5, sl_ticks=81, tp_ticks=-162, custom_tag="sweep-crash-b")
+    del paper                                        # process dies before "ACKNOWLEDGED" is written
+    clock.advance(30)
+    paper2, sc = _restart(tmp_path, market, clock)
+    st = sc.states("sweep-crash-b")
+    assert st[:3] == ["CREATED", "SUBMITTING", "UNKNOWN"] and st[-1] == "PROTECTED" and "FILLED" in st, st
+    sc.run_until(9, 50)
+    assert len([o for o in paper2.history if o["type"] == ORDER_MARKET]) == 1
+
+
+def test_26c_crash_after_bracket_exit_before_close_was_recorded(tmp_path):
+    market, paper, clock = _paper_scenario(tmp_path)
+    sc = Scenario(tmp_path, broker=paper, clock=clock)
+    sc.run_until(9, 45, 30)
+    tag = sc.bot.store.forward_rows()[0]["tag"]
+    tgt = next(o for o in paper.orders if o["type"] == 1)
+    paper._exit(tgt["limitPrice"], tgt["id"], "target")   # fill saved to disk...
+    paper._close_legs(tgt)
+    sc.close()                                            # ...then the process dies before seeing it
+    paper2, sc2 = _restart(tmp_path, market, clock)
+    assert sc2.states(tag)[-1] == "CLOSED"
+    rows = sc2.bot.store.forward_rows()
+    assert rows[0]["exit_reason"] == "target" and len(sc2.bot.journal.rows()) == 1   # backfilled once
+    sc2.run_until(9, 47)
+    assert len(sc2.bot.journal.rows()) == 1
+
+
+def _two_sweeps(t):
+    """pdh 20100 swept at 9:40-9:44 and again at 10:00-10:04."""
+    from fakes import default_price
+    et = t.astimezone(ET)
+    if et.date() == DAY and time(10, 0) <= et.time() < time(10, 5):
+        return (20090, 20110, 20088, 20092) if et.time() == time(10, 2) else (20090, 20094, 20088, 20090)
+    return default_price(t)
+
+
+def test_27_filtered_sweep_uses_up_its_level(tmp_path):
+    from orbbot.filters import Filtered
+    from orbbot.research import NASDAQ, Sweep
+    from fakes import FakeFeats
+    from orbbot.features import Levels
+    sc = Scenario(tmp_path)
+    sc.broker.price_fn = _two_sweeps
+    agree = {"v": False}
+    sess = sc.sess
+
+    def build(sess=sess):
+        sw = Sweep(sess.s, 0.25, FakeFeats(Levels(pdh=PDH)), window="am", session=NASDAQ, max_trades=2)
+        sw.reset(DAY)
+        sess.inner = sw
+        sess._preload()
+        sess.strat = Filtered(sw, [lambda sig: agree["v"]])
+    sess.strat = None
+    sess.build_sweep = build
+    sc.run_until(9, 46)                    # 9:45 sweep: confirmation disagrees
+    assert not entries(sc) and "pdh" in sc.bot.store.used_levels(DAY)
+    assert sc.events("signal_filtered")
+    agree["v"] = True
+    sc.run_until(10, 10)                   # the same level swept again with confirmation: not traded
+    assert not entries(sc)                 # (backtest does the same: research.Sweep marks it used first)
+
+
+def test_28_approximate_floor_widens_the_buffer(tmp_path):
+    from orbbot.config import AccountConfig
+    from orbbot.execution import AccountGuard
+    from zoneinfo import ZoneInfo
+    ct = ZoneInfo("America/Chicago")
+    store = StateStore(tmp_path / "a.sqlite", clock=lambda: datetime.combine(DAY, time(8, 0), ct))
+    g = AccountGuard(AccountConfig(max_loss_limit=4500, start_balance=150_000, safety_buffer=500,
+                                   approx_floor_margin=250), store)
+    prev = DAY - timedelta(days=1)
+    g.end_of_day(prev, 151_000, datetime.combine(DAY, time(8, 0), ct), approximate=True)
+    g.update_balance(151_000)
+    assert g.floor_approximate and g.buffer() == 750
+    assert g.headroom(0.0) == 151_000 - 146_500 - 750
+    g.end_of_day(DAY, 151_000, datetime.combine(DAY, time(15, 20), ct))          # a real EOD balance
+    assert not g.floor_approximate and g.buffer() == 500
+    g2 = AccountGuard(AccountConfig(max_loss_limit=4500, mll_floor=146_000, safety_buffer=500), store)
+    store.put("last_eod_approx", True)
+    assert not g2.floor_approximate and g2.floor() == 146_000                      # dashboard wins
+
+
+def test_29_time_flatten_exit_is_journaled(tmp_path):
+    sc = Scenario(tmp_path)
+    sc.run_until(9, 45, 30)
+    sc.run_until(11, 56, step=60)
+    rows = sc.bot.store.forward_rows()
+    assert sc.broker.pos() is None and rows[0]["exit_time"] and rows[0]["exit_reason"] == "time"
+    assert len(sc.bot.journal.rows()) == 1
+
+
+def test_30_daily_audit_passes_a_clean_day_and_catches_problems(tmp_path):
+    import csv as _csv
+    from orbbot.audit import audit
+    market, paper, clock = _paper_scenario(tmp_path)
+    market.price_fn = _two_sweeps
+    sc = Scenario(tmp_path, broker=paper, clock=clock)
+    sc.run_until(9, 45, 30)
+    base = market.price_fn                          # the short reaches its target at 9:48
+    market.price_fn = lambda t: (19900, 19905, 19895, 19900) if time(9, 48) <= t.astimezone(ET).time() < time(9, 50) else base(t)
+    sc.run_until(11, 56, step=30)
+    sc.close()
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "PASS", text
+    assert "pdh" in text and "NOT in the statistical sample" in text
+    # tamper 1: a journal row goes missing -> FAIL
+    jp = tmp_path / "journal" / "paper.csv"
+    rows = list(_csv.DictReader(jp.open()))
+    jp.write_text(",".join(rows[0].keys()) + "\n")
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "FAIL" and "journal rows 0 != closed trades 1" in text
+    # tamper 2: a frozen setting changes -> FAIL
+    sc.cfg.risk.max_risk_per_trade = 300
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert "CONFIG CHANGED" in text

@@ -65,6 +65,15 @@ class AccountConfig:
     mll_floor: float = 0.0             # optional: the current MLL floor from your dashboard (overrides)
     safety_buffer: float = 500.0       # stop opening trades this far above the floor
     flatten_at_buffer: bool = True     # flatten an open trade if equity falls inside the buffer
+    approx_floor_margin: float = 250.0  # extra buffer while the latest end-of-day balance was approximate
+
+
+@dataclass
+class ForwardTestConfig:
+    """Pre-registered forward test. Trades on or after sample_start form the statistical sample;
+    earlier ones (the operational week) are reported separately and never pooled with it."""
+    sample_start: date | None = None
+    operational_start: date | None = None
 
 
 @dataclass
@@ -104,6 +113,7 @@ class BotConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    forward_test: ForwardTestConfig = field(default_factory=ForwardTestConfig)
 
     @property
     def username(self) -> str:
@@ -140,6 +150,11 @@ def load_config(path: str | Path) -> BotConfig:
     _fill(cfg.risk, raw.pop("risk", {}))
     _fill(cfg.account, raw.pop("account", {}))
     _fill(cfg.safety, raw.pop("safety", {}))
+    ft = raw.pop("forward_test", {}) or {}
+    for k in ("sample_start", "operational_start"):
+        if ft.get(k) is not None and not isinstance(ft[k], date):
+            ft[k] = date.fromisoformat(str(ft[k]))
+    _fill(cfg.forward_test, ft)
     holidays = raw.pop("holidays", []) or []
     _fill(cfg, raw)
     cfg.holidays = [h if isinstance(h, date) else date.fromisoformat(str(h)) for h in holidays]

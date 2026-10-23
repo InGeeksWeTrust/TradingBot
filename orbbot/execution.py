@@ -169,18 +169,29 @@ class AccountGuard:
         peak = self.store.get("peak_eod_balance", self.start_balance() or balance)
         self.store.put("peak_eod_balance", max(peak, balance))
         self.store.put("last_eod_day", day.isoformat())
+        self.store.put("last_eod_approx", bool(approximate))
         self.store.event("eod_balance", f"{day}: {balance:.2f}{' (approximate: taken after the fact)' if approximate else ''}"
                                         f" -> floor {self.floor()}")
         return True
 
+    @property
+    def floor_approximate(self) -> bool:
+        """The floor rests on an end-of-day balance taken after the fact (and no dashboard override)."""
+        return self.enabled and not self.a.mll_floor and bool(self.store.get("last_eod_approx", False))
+
+    def buffer(self) -> float:
+        return self.a.safety_buffer + (self.a.approx_floor_margin if self.floor_approximate else 0.0)
+
     def headroom(self, open_pnl: float) -> float | None:
-        """Equity above floor + buffer (None = unknown -> no entries)."""
+        """Equity above floor + buffer (None = unknown -> no entries). While the floor is approximate
+        the buffer is widened by approx_floor_margin, so an under-estimated floor can't let a trade
+        come closer to the real limit than the configured buffer."""
         if not self.enabled:
             return float("inf")
         f = self.floor()
         if f is None or self.balance is None:
             return None
-        return self.balance + open_pnl - f - self.a.safety_buffer
+        return self.balance + open_pnl - f - self.buffer()
 
 
 # ---------------------------------------------------------------------- protection check
@@ -505,6 +516,7 @@ class ExecutionEngine:
             if self.position() is None and not left:
                 if self.active and S(self.active["state"]) == S.EXIT_PENDING:
                     self.transition(self.active, S.CLOSED, f"flattened: {why}")
+                    self.last_closed = self.active
                     self.active = None
                 self.store.event("flatten_done", why)
                 self.unblock("flatten_failed")

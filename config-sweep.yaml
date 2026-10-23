@@ -81,3 +81,10 @@ safety:
   stop_price_tolerance_ticks: 4
   flatten_attempts: 3
   stale_position_flatten_s: 0   # 0 = rely on the broker-side stop while data is stale
+
+forward_test:             # PRE-REGISTERED 2026-10-23 (see the report's "Operational week" section)
+  operational_start: 2026-10-23   # operational validation: 5 sessions, Oct 23 and Oct 26-29
+  sample_start: 2026-11-02        # first session of the prospective statistical sample. Fixed regardless of
+                                  # results. Only if the operational week FAILS does it move, to the Monday
+                                  # after the first clean 5-session operational week. Trades before it are
+                                  # never pooled with the sample.

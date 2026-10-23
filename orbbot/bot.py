@@ -276,6 +276,12 @@ class Session:
         action = self.engine.recover(self.day, self.fresh, self.expected_stop)
         if action == "flatten":
             self.do_flatten("start-up: open position without verified protection")
+        for it in self.store.intents_for_day(self.day):   # crash between a close and its journal row
+            if it["state"] == S.CLOSED.value and it.get("filled_qty"):
+                self.ensure_recorded(it, None)
+        if self.acct.floor_approximate:
+            self.store.event("mll_floor_approximate", f"floor {self.acct.floor()} rests on an after-the-fact "
+                             f"balance; buffer widened to ${self.acct.buffer():.0f} until a real end-of-day balance")
         log.info("=== Session %s | %s %s | contracts<=%d | realized $%.2f | mode=%s ===", self.day, self.cfg.symbol,
                  self.cfg.entry + (f" + {self.cfg.confirm_symbol} confirm" if b.confirm_spec else ""),
                  b.contracts, self.realized, b.mode)
@@ -374,10 +380,20 @@ class Session:
 
     def do_flatten(self, why: str) -> bool:
         self._last_flatten = self.now()
+        self.engine.last_closed = None
         ok = self.engine.flatten(why, self.fresh)
         self.halt(why)
         self.refresh_realized(force=True)
+        if ok and self.engine.last_closed:
+            self.ensure_recorded(self.engine.last_closed, "flatten" if "flatten time" not in why else "time")
         return ok
+
+    def ensure_recorded(self, intent: dict, reason: str | None) -> None:
+        """Journal + forward exit for a closed intent, once (also used to backfill after a crash)."""
+        row = next((r for r in self.store.forward_rows() if r["tag"] == intent["tag"]), None)
+        if row is not None and row.get("exit_time"):
+            return
+        self.record_exit(intent, reason)
 
     def record_exit(self, intent: dict, reason: str | None) -> None:
         """Journal + forward-test record for a finished round trip, from the broker's fills."""
@@ -453,7 +469,7 @@ class Session:
         if res == "closed":
             it = eng.last_closed
             if it:
-                self.record_exit(it, None)
+                self.ensure_recorded(it, None)
             eng.refresh(self.fresh)
             self.refresh_realized(force=True)
             self.refresh_account(force=True)

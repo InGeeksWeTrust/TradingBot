@@ -214,6 +214,22 @@ python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv -
 Only if one beats plain `sweep` in both TRAIN and TEST, run it on the holdout, then turn it on in
 `config-sweep.yaml` with `sweep_extra: [or]` (or `[swing]`, or `[or, swing]`).
 
+## Operational week and daily audit (from 2026-10-23)
+
+After each session (any time after 8:55 AZ; ideally after 3:00 PM AZ so the end-of-day balance is in):
+```powershell
+python -m orbbot.audit --config config-sweep.yaml
+```
+It writes `audit\<date>.md` with PASS / WARN / FAIL for: state database vs paper account vs journal
+agreement, sweep levels used (including ones the ES filter blocked), each trade's full order lifecycle
+and forward record, the Maximum Loss Limit floor (and whether it is approximate), CRITICAL/flatten/
+crash events, and a fingerprint of the frozen settings (any change = FAIL).
+
+Pre-registered dates (`forward_test:` in config-sweep.yaml): operational validation Oct 23 and Oct 26-29
+(5 sessions); the statistical sample starts **Monday 2026-11-02**. Nothing before that date is pooled
+with the sample. The date moves only if the operational week fails (to the Monday after the first clean
+5-session week).
+
 ## Execution safety (Phase 5, 2026-10-22)
 
 **Modes.** `--dry-run` paper trades, `--read-only` connects, reconciles and prints positions, orders,
