@@ -650,3 +650,18 @@ def test_30_daily_audit_passes_a_clean_day_and_catches_problems(tmp_path):
     sc.cfg.risk.max_risk_per_trade = 300
     overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
     assert "CONFIG CHANGED" in text
+
+
+def test_31_audit_missing_paper_file_passes_a_quiet_day_and_fails_with_intents(tmp_path):
+    from orbbot.audit import audit
+    quiet = tmp_path / "quiet"                      # no intents, no paper file -> PASS
+    overall, text = audit(make_cfg(quiet), DAY, "paper", root=quiet)
+    assert "| 1 cross-store | PASS | no paper broker activity today |" in text
+    market, paper, clock = _paper_scenario(tmp_path)
+    market.price_fn = _two_sweeps
+    sc = Scenario(tmp_path, broker=paper, clock=clock)
+    sc.run_until(9, 45, 30)
+    sc.close()
+    (tmp_path / "state" / "paper_broker.json").unlink()   # intents but no paper file -> FAIL
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "FAIL" and "| 1 cross-store | FAIL | no paper account file but 1 entry intent(s) today |" in text

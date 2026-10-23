@@ -97,6 +97,10 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
         open_ids = broker.get("open_ids") or []
         if open_ids:
             add("1 cross-store", WARN, f"{len(open_ids)} working order(s) left on the paper account")
+    elif mode == "paper":       # the paper broker writes its file on the first simulated order
+        add("1 cross-store", FAIL if intents else PASS,
+            f"no paper account file but {len(intents)} entry intent(s) today" if intents else
+            "no paper broker activity today")
     else:
         add("1 cross-store", WARN, "no paper account file to compare (live: run --read-only)")
     unfinished = [i for i in intents if S(i["state"]) not in (S.CLOSED, S.CANCELLED, S.REJECTED)]
