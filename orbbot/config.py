@@ -57,6 +57,34 @@ class RiskConfig:
 
 
 @dataclass
+class AccountConfig:
+    """Account-level protection (Topstep Maximum Loss Limit). The ProjectX API returns only the
+    balance, not the MLL, so the limit is configured here. 0 = no MLL (practice account)."""
+    max_loss_limit: float = 0.0        # e.g. 2000 / 3000 / 4500 for a 50K / 100K / 150K combine
+    start_balance: float = 0.0         # combine starting balance; 0 = first balance the bot sees
+    mll_floor: float = 0.0             # optional: the current MLL floor from your dashboard (overrides)
+    safety_buffer: float = 500.0       # stop opening trades this far above the floor
+    flatten_at_buffer: bool = True     # flatten an open trade if equity falls inside the buffer
+
+
+@dataclass
+class SafetyConfig:
+    live_trading_enabled: bool = False  # live orders also need --live on the command line
+    state_dir: str = "state"            # SQLite order/level/day state (one file per mode)
+    halt_file: str = "HALT"             # create to stop NEW entries (open trades stay protected)
+    bars_max_age_s: float = 180.0       # newest completed 1-min bar older than this = stale
+    confirm_max_age_s: float = 180.0    # same for the confirmation market
+    positions_max_age_s: float = 20.0   # last good Position/searchOpen
+    orders_max_age_s: float = 20.0      # last good Order/searchOpen
+    account_max_age_s: float = 120.0    # last good Account/search
+    protection_grace_s: float = 15.0    # time after a fill for the bracket stop to appear
+    reconcile_grace_s: float = 30.0     # how long an unconfirmed order is looked for before "absent"
+    stop_price_tolerance_ticks: int = 4  # bracket stop may sit this far from plan (entry slippage)
+    flatten_attempts: int = 3
+    stale_position_flatten_s: float = 0.0  # >0: flatten if protection can't be checked this long
+
+
+@dataclass
 class BotConfig:
     symbol: str = "MNQ"
     entry: str = "orb"                 # entry rule for the live bot: orb | sweep
@@ -73,6 +101,8 @@ class BotConfig:
     journal_dir: str = "journal"
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    account: AccountConfig = field(default_factory=AccountConfig)
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
 
     @property
     def username(self) -> str:
@@ -107,6 +137,8 @@ def load_config(path: str | Path) -> BotConfig:
     cfg = BotConfig()
     _fill(cfg.strategy, raw.pop("strategy", {}))
     _fill(cfg.risk, raw.pop("risk", {}))
+    _fill(cfg.account, raw.pop("account", {}))
+    _fill(cfg.safety, raw.pop("safety", {}))
     holidays = raw.pop("holidays", []) or []
     _fill(cfg, raw)
     cfg.holidays = [h if isinstance(h, date) else date.fromisoformat(str(h)) for h in holidays]
@@ -126,3 +158,6 @@ def validate(cfg: BotConfig) -> None:
     assert s.entry_cutoff > s.or_start, "entry_cutoff must be after the session open"
     assert cfg.entry in {"orb", "sweep"}, "entry must be orb or sweep"
     assert set(cfg.sweep_extra) <= {"or", "swing"}, "sweep_extra may only contain: or, swing"
+    a = cfg.account
+    assert a.max_loss_limit >= 0 and a.safety_buffer >= 0
+    assert cfg.safety.flatten_attempts >= 1

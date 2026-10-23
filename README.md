@@ -214,6 +214,44 @@ python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv -
 Only if one beats plain `sweep` in both TRAIN and TEST, run it on the holdout, then turn it on in
 `config-sweep.yaml` with `sweep_extra: [or]` (or `[swing]`, or `[or, swing]`).
 
+## Execution safety (Phase 5, 2026-10-22)
+
+**Modes.** `--dry-run` paper trades, `--read-only` connects, reconciles and prints positions, orders,
+protection status and unfinished intents without sending anything, and `--live` sends real orders only
+if `safety.live_trading_enabled: true` is also set. With no mode flag the bot refuses to start.
+
+**State.** `state/paper.sqlite` (or `state/live.sqlite`) holds every order intent and each state change,
+the sweep levels used, trades per day, halts, account trailing data, events, and a forward-test row per
+trade (signal time/price, submission, acknowledgement, fill, slippage, stop/target, fees, P&L, MFE/MAE,
+equity). Export it with `python -m orbbot.state state/paper.sqlite forward.csv`.
+
+**Orders.** Each entry is recorded (with its level and the day's trade count) before it is sent, sent
+once, and never resent. A timeout, dropped connection, HTTP 5xx/401/429, errorCode 6 or 7, or a
+duplicate-customTag answer makes it UNKNOWN; the bot then looks it up by its customTag and only calls it
+"not accepted" after the broker's orders and positions show nothing for 30 s. New entries stay blocked
+until then. States: CREATED, SUBMITTING, ACKNOWLEDGED, PARTIALLY_FILLED, FILLED, PROTECTED,
+EXIT_PENDING, CLOSED, CANCELLED, REJECTED, UNKNOWN, RECONCILING (only listed transitions are allowed).
+
+**Protection.** A position is protected only by a working stop on the same contract, opposite side,
+exactly the position's size, on the loss side of entry and within 4 ticks of the planned stop. If that
+isn't true 15 s after the fill (or stops being true later, e.g. after a partial target fill), the bot
+flattens with Position/closeContract (closes exactly the open size, can't reverse), cancels leftovers,
+verifies, and halts for the day. A failed flatten is retried every 30 s and reported as CRITICAL.
+
+**Restart.** Start-up runs in a no-entry reconciliation state: broker orders, positions and fills are
+authoritative; unfinished intents are resolved; a still-working entry order is cancelled; an open
+position must show valid protection or is flattened; levels used and trade counts come from the state
+file plus a replay of the morning's bars, so a restart can never re-trade a level.
+
+**Data and account.** Entries need fresh bars (and confirmation bars), positions, orders and account
+balance. With a position open and stale prices the bot does not act on the old price; it relies on the
+broker-side stop (set `stale_position_flatten_s` to flatten after a while instead). The account guard
+uses the API balance plus open P&L against the Topstep Maximum Loss Limit you configure under `account:`
+(the API does not return the limit): no entry whose worst-case loss would reach the buffer, and flatten
+if equity enters it.
+
+**Kill switches.** File `HALT`: no new entries, an open trade stays managed. File `STOP`: flatten and halt.
+
 ## Contract rolls and the entry cutoff (2026-10-22)
 
 **Rolls.** Databento's `.v.0` series switches contract at an evening open, so on 8 sessions a year the

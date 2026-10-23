@@ -1,56 +1,83 @@
-# Paper-trade the sweep + MES confirmation strategy on MNQ:
-#   python -m orbbot.bot --config config-sweep.yaml --dry-run --once
-# Copy account_name from your config.yaml.
-# ORB bot config. Credentials are NOT stored here:
-#   export TOPSTEPX_USERNAME="your TopstepX username"
-#   export TOPSTEPX_API_KEY="key generated in TopstepX > Settings > API"
+# FROZEN forward-test configuration: Strategy A (MNQ liquidity sweep + ES VWAP confirmation).
+# Frozen 2026-10-22. Do not change any strategy or risk setting while the forward sample is collected.
+#
+# Paper (supervised forward test):   python -m orbbot.bot --config config-sweep.yaml --dry-run
+# Check the account, send nothing:   python -m orbbot.bot --config config-sweep.yaml --read-only
+# Live is off: it needs safety.live_trading_enabled: true AND --live.
+#
+# Credentials are NOT stored here (TOPSTEPX_USERNAME / TOPSTEPX_API_KEY environment variables).
 
 symbol: MNQ
-entry: sweep              # sweep reversal at prior-day / overnight highs and lows
-confirm_symbol: MES       # only trade when MES is on the same side of its VWAP
+entry: sweep              # 5-min wick through the prior-day or overnight high/low that closes back -> fade
+confirm_symbol: ES        # ES must be on the trade's side of its session VWAP. ES is what every backtest
+                          # used; until 2026-10-22 the paper bot used MES (same index, different volume
+                          # weights). Check the log shows "Contract ESZ6"; if ES isn't offered, set MES.
 history_days: 6
-account_name: "PRAC-V2-387652-21891938"          # leave blank on first run; the bot will list your accounts and exit
+account_name: "PRAC-V2-387652-21891938"
 poll_seconds: 5
 trading_days: [0, 1, 2, 3, 4]   # Mon-Fri
-holidays:                 # CME closed / early-close days to skip (add as needed)
+holidays:                 # CME closed / early-close days to skip
   - 2026-11-26            # Thanksgiving
   - 2026-11-27            # day after Thanksgiving (early close)
   - 2026-12-24
   - 2026-12-25
   - 2027-01-01
-kill_switch_file: STOP    # `touch STOP` in the working dir to flatten and halt for the day
+kill_switch_file: STOP    # create a file named STOP: flatten and halt for the day
 log_dir: logs
-journal_dir: journal      # paper.xlsx / live.xlsx / backtest.xlsx land here
+journal_dir: journal      # paper.xlsx / paper.csv
 
-strategy:                 # times are US/Eastern. 09:30 ET = 6:30 AZ in summer, 7:30 AZ in winter (Nov-Mar)
+strategy:                 # times are US/Eastern (09:30 ET = 6:30 AZ until Nov 1, 7:30 AZ after)
   or_start: "09:30"
-  or_minutes: 15          # 09:30-09:45 ET opening range
-  signal_tf_minutes: 5    # breakout confirmed on a 5-minute close outside the range
-  entry_cutoff: "11:00"   # no new entries after 11:00 ET
-  flatten_time: "11:55"   # force flat 11:55 ET
+  or_minutes: 15
+  signal_tf_minutes: 5
+  entry_cutoff: "11:00"   # FROZEN: last signal bar closes by 11:00 ET (8:00 AZ, 9:00 AZ after Nov 1)
+  flatten_time: "11:55"   # flat by 11:55 ET
   breakout_buffer_ticks: 0
   min_range_points: 10
   max_range_points: 150
-  max_chase_points: 0     # 0 = off
-  max_trades_per_day: 2   # (sweep takes at most 2 a day: each level once)
+  max_chase_points: 0
+  max_trades_per_day: 2   # FROZEN
   one_trade_per_side: true
   allow_long: true
   allow_short: true
 
 risk:
-  contracts: 10           # run with --contracts 20 (or change here) to size up
-  max_contracts: 20
+  contracts: 10
+  max_contracts: 10       # FROZEN hard cap
   min_contracts: 1
-  size_with_costs: true
-  stop_mode: structural   # stop just beyond the sweep; contracts sized so risk stays $250
+  stop_mode: structural   # FROZEN: 1 tick beyond the sweep wick; only the contract count changes
   fixed_stop_points: 12.5
-  max_risk_per_trade: 250 # 10 MNQ -> 12.5 pt stop; 20 MNQ -> 6.25 pt stop
-  target_per_trade: 500   # 2:1
+  max_risk_per_trade: 250 # FROZEN: stop + costs per trade
+  target_per_trade: 500   # FROZEN: 2R
   min_stop_ticks: 8
-  reward_risk: 2.0        # only used if target_per_trade is 0
-  max_daily_loss: 500
-  max_daily_profit: 750
-  min_reward_r: 1.0       # skip a trade if the $750 cap would trim its target below 1R
+  reward_risk: 2.0
+  max_daily_loss: 500     # FROZEN
+  max_daily_profit: 750   # FROZEN
+  min_reward_r: 1.0
   loss_buffer: 25
-  fee_per_contract_rt: 0.74   # estimate; check your fee schedule
+  fee_per_contract_rt: 1.22   # TopstepX MNQ/MES round turn (help.topstep.com, Oct 2026)
   include_fees_in_pnl: true
+  size_with_costs: true       # FROZEN: stop $ + 1 tick slippage each side + fees <= $250
+  est_slippage_ticks: 1
+
+account:                  # Topstep Maximum Loss Limit guard. A practice account has no MLL; these
+  max_loss_limit: 4500    # rehearse a 150K combine's rule so the guard is exercised every day.
+  start_balance: 150000   # For a real combine, set its size here, or copy the floor from the
+  mll_floor: 0            # dashboard into mll_floor (it overrides the calculation).
+  safety_buffer: 500      # no new trades within $500 of the floor; flatten inside it
+  flatten_at_buffer: true
+
+safety:
+  live_trading_enabled: false
+  state_dir: state        # state/paper.sqlite: order intents, levels used, events, forward-test record
+  halt_file: HALT         # create a file named HALT: no NEW entries, open trade stays managed
+  bars_max_age_s: 180
+  confirm_max_age_s: 180
+  positions_max_age_s: 20
+  orders_max_age_s: 20
+  account_max_age_s: 120
+  protection_grace_s: 15
+  reconcile_grace_s: 30
+  stop_price_tolerance_ticks: 4
+  flatten_attempts: 3
+  stale_position_flatten_s: 0   # 0 = rely on the broker-side stop while data is stale

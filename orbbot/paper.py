@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from .api import ORDER_LIMIT, ORDER_MARKET, ORDER_STOP, POS_LONG, POS_SHORT, SIDE_BUY
+from .api import (ORDER_LIMIT, ORDER_MARKET, ORDER_STOP, POS_LONG, POS_SHORT, SIDE_BUY, STATUS_CANCELLED,
+                  STATUS_FILLED, STATUS_OPEN, ApiError)
 
 log = logging.getLogger(__name__)
 
@@ -32,8 +33,11 @@ class PaperClient:
         self.last_price: float | None = None
         self.last_time: datetime | None = None
         self.pos: dict | None = None
-        self.orders: list[dict] = []
+        self.orders: list[dict] = []      # working (open) orders
+        self.history: list[dict] = []     # every order ever placed, any status (Order/search)
         self.trades: list[dict] = []
+        self.tags: set[str] = set()
+        self.start_balance: float | None = None
         self._id = 1
         self.watch: str | None = None  # contract whose bars drive simulated fills
 
@@ -45,7 +49,12 @@ class PaperClient:
         return self.real.login()
 
     def search_accounts(self, only_active: bool = True):
-        return self.real.search_accounts(only_active)
+        """Real accounts, with the balance moved by the simulated trades' net P&L (fees included)."""
+        accts = [dict(a) for a in self.real.search_accounts(only_active)]
+        net = sum((t["profitAndLoss"] or 0) - t["fees"] for t in self.trades if not t.get("voided"))
+        for a in accts:
+            a["balance"] = float(a.get("balance") or 0) + net
+        return accts
 
     def search_contracts(self, text: str, live: bool = False):
         return self.real.search_contracts(text, live)
@@ -77,24 +86,35 @@ class PaperClient:
                     sl_ticks=None, tp_ticks=None, custom_tag=None) -> int:
         if order_type != ORDER_MARKET:
             raise NotImplementedError("paper broker only simulates market entries")
+        if custom_tag and custom_tag in self.tags:
+            raise ApiError("Order/place", 2, "customTag must be unique across the account")
         if self.last_price is None:
-            raise RuntimeError("no price yet")
+            raise ApiError("Order/place", 2, "no last price")
         if self.pos:
-            raise RuntimeError("paper broker: already in a position")
+            raise ApiError("Order/place", 2, "paper broker: already in a position")
+        if custom_tag:
+            self.tags.add(custom_tag)
         buy = side == SIDE_BUY
         slip = self.slip_ticks * self.tick
         px = self.last_price + slip if buy else self.last_price - slip
         oid = self._next()
+        now = self._now().isoformat()
+        self.history.append({"id": oid, "accountId": account_id, "contractId": contract_id, "creationTimestamp": now,
+                             "updateTimestamp": now, "status": STATUS_FILLED, "type": ORDER_MARKET, "side": side,
+                             "size": size, "limitPrice": None, "stopPrice": None, "fillVolume": size,
+                             "filledPrice": px, "customTag": custom_tag})
         self.pos = {"id": oid, "accountId": account_id, "contractId": contract_id,
                     "creationTimestamp": self._now().isoformat(), "type": POS_LONG if buy else POS_SHORT,
                     "size": size, "averagePrice": px, "_fill_minute": self.last_time}
         self._fill(buy, size, px, None, oid)
+        leg = {"accountId": account_id, "contractId": contract_id, "creationTimestamp": now, "updateTimestamp": now,
+               "status": STATUS_OPEN, "side": 1 if buy else 0, "size": size, "fillVolume": 0, "filledPrice": None,
+               "customTag": None, "limitPrice": None, "stopPrice": None}
         if sl_ticks is not None:
-            self.orders.append({"id": self._next(), "contractId": contract_id, "type": ORDER_STOP,
-                                "side": 1 if buy else 0, "size": size, "stopPrice": px + sl_ticks * self.tick})
+            self.orders.append({**leg, "id": self._next(), "type": ORDER_STOP, "stopPrice": px + sl_ticks * self.tick})
         if tp_ticks is not None:
-            self.orders.append({"id": self._next(), "contractId": contract_id, "type": ORDER_LIMIT,
-                                "side": 1 if buy else 0, "size": size, "limitPrice": px + tp_ticks * self.tick})
+            self.orders.append({**leg, "id": self._next(), "type": ORDER_LIMIT, "limitPrice": px + tp_ticks * self.tick})
+        self.history.extend(self.orders[-2:] if (sl_ticks is not None and tp_ticks is not None) else self.orders[-1:])
         log.info("[paper] filled %s %d @ %.2f", "BUY" if buy else "SELL", size, px)
         return oid
 
@@ -115,10 +135,17 @@ class PaperClient:
         tgt = next((o for o in self.orders if o["type"] == ORDER_LIMIT), None)
         if stop and ((long and lo <= stop["stopPrice"]) or (not long and hi >= stop["stopPrice"])):
             self._exit(stop["stopPrice"] - slip if long else stop["stopPrice"] + slip, stop["id"], "stop")
-            self.orders = []  # OCO: sibling cancelled
+            self._close_legs(stop)  # OCO: sibling cancelled
         elif tgt and ((long and hi >= tgt["limitPrice"]) or (not long and lo <= tgt["limitPrice"])):
             self._exit(tgt["limitPrice"], tgt["id"], "target")
-            self.orders = []
+            self._close_legs(tgt)
+
+    def _close_legs(self, filled: dict) -> None:
+        for o in self.orders:
+            o["status"] = STATUS_FILLED if o is filled else STATUS_CANCELLED
+            if o is filled:
+                o["fillVolume"] = o["size"]
+        self.orders = []
 
     def _on_bars(self, bars: list[dict]) -> None:
         if not bars:
@@ -137,10 +164,21 @@ class PaperClient:
         return [{k: v for k, v in self.pos.items() if not k.startswith("_")}] if self.pos else []
 
     def search_open_orders(self, account_id):
-        return list(self.orders)
+        return [dict(o) for o in self.orders]
 
     def cancel_order(self, account_id, order_id):
+        for o in self.orders:
+            if o["id"] == order_id:
+                o["status"] = STATUS_CANCELLED
         self.orders = [o for o in self.orders if o["id"] != order_id]
+
+    def search_orders(self, account_id, start, end=None):
+        out = []
+        for o in self.history:
+            ts = datetime.fromisoformat(o["creationTimestamp"])
+            if ts >= start and (end is None or ts <= end):
+                out.append(dict(o))
+        return out
 
     def close_position(self, account_id, contract_id):
         if not self.pos:

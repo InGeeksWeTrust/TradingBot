@@ -18,8 +18,9 @@ log = logging.getLogger(__name__)
 
 TOPSTEPX_BASE = "https://api.topstepx.com"
 
-# Enums from the Gateway docs
-ORDER_LIMIT, ORDER_MARKET, ORDER_STOP, ORDER_TRAILING_STOP = 1, 2, 4, 5
+# Enums from the Gateway docs (gateway.docs.projectx.com, realtime "Enums")
+ORDER_LIMIT, ORDER_MARKET, ORDER_STOP_LIMIT, ORDER_STOP, ORDER_TRAILING_STOP = 1, 2, 3, 4, 5
+STATUS_NONE, STATUS_OPEN, STATUS_FILLED, STATUS_CANCELLED, STATUS_EXPIRED, STATUS_REJECTED, STATUS_PENDING = range(7)
 SIDE_BUY, SIDE_SELL = 0, 1
 POS_LONG, POS_SHORT = 1, 2
 BAR_SECOND, BAR_MINUTE, BAR_HOUR, BAR_DAY = 1, 2, 3, 4
@@ -39,9 +40,28 @@ LOGIN_ERRORS = {
 
 
 class ApiError(RuntimeError):
+    """The gateway answered success=false. For Order/place, codes 6 (OrderPending) and 7 (UnknownError)
+    do not say whether the order exists, and code 2 is also used for a duplicate customTag (the text is
+    undocumented), so callers must reconcile instead of treating every ApiError as a rejection."""
+
     def __init__(self, path: str, code: Any, message: Any):
         super().__init__(f"{path} failed: errorCode={code} errorMessage={message}")
         self.path, self.code, self.message = path, code, message
+
+    @property
+    def ambiguous(self) -> bool:
+        if self.code in (6, 7):
+            return True
+        return self.code == 2 and "tag" in str(self.message or "").lower()
+
+
+class AmbiguousError(RuntimeError):
+    """A non-idempotent request may or may not have reached the broker (timeout, dropped connection,
+    HTTP 5xx, 401/429 on the only attempt). Never resend; reconcile."""
+
+    def __init__(self, path: str, cause: Any):
+        super().__init__(f"{path}: outcome unknown ({cause})")
+        self.path, self.cause = path, cause
 
 
 def iso(dt: datetime) -> str:
@@ -75,9 +95,31 @@ class ProjectXClient:
         self._token_time = time.time()
         log.info("Authenticated to %s", self.base)
 
-    def _post(self, path: str, payload: dict, retries: int = 3) -> dict:
+    def _post(self, path: str, payload: dict, retries: int = 3, idempotent: bool = True) -> dict:
+        """Reads (and idempotent calls) retry; a non-idempotent call (Order/place) is sent exactly once
+        and any doubt about its outcome raises AmbiguousError for the caller to reconcile."""
         if time.time() - self._token_time > TOKEN_MAX_AGE_S:
             self.login()
+        if not idempotent:
+            try:
+                r = self.s.post(f"{self.base}/api/{path}", json=payload, timeout=self.timeout)
+            except requests.RequestException as e:
+                raise AmbiguousError(path, e) from e
+            if r.status_code in (401, 429) or r.status_code >= 500:
+                if r.status_code == 401:
+                    try:
+                        self.login()
+                    except Exception:  # noqa: BLE001 - the caller reconciles either way
+                        pass
+                raise AmbiguousError(path, f"HTTP {r.status_code}")
+            try:
+                r.raise_for_status()
+                d = r.json()
+            except (requests.RequestException, ValueError) as e:
+                raise AmbiguousError(path, e) from e
+            if not d.get("success", False):
+                raise ApiError(path, d.get("errorCode"), d.get("errorMessage"))
+            return d
         last_err: Exception | None = None
         for attempt in range(retries):
             try:
@@ -130,17 +172,25 @@ class ProjectXClient:
         payload: dict[str, Any] = {
             "accountId": account_id, "contractId": contract_id, "type": order_type, "side": side,
             "size": size, "limitPrice": limit_price, "stopPrice": stop_price, "trailPrice": None,
-            # customTag must be unique per account, so a retried request can't double-fill.
+            # customTag must be unique across the account (gateway docs); used to find the order
+            # again after an ambiguous response. It is NOT relied on to make resends safe: we never resend.
             "customTag": custom_tag,
         }
         if sl_ticks is not None:
             payload["stopLossBracket"] = {"ticks": sl_ticks, "type": ORDER_STOP}
         if tp_ticks is not None:
             payload["takeProfitBracket"] = {"ticks": tp_ticks, "type": ORDER_LIMIT}
-        return self._post("Order/place", payload)["orderId"]
+        return self._post("Order/place", payload, idempotent=False)["orderId"]
 
     def cancel_order(self, account_id: int, order_id: int) -> None:
         self._post("Order/cancel", {"accountId": account_id, "orderId": order_id})
+
+    def search_orders(self, account_id: int, start: datetime, end: datetime | None = None) -> list[dict]:
+        """All orders (any status) created since `start`: used to find an order by its customTag."""
+        payload = {"accountId": account_id, "startTimestamp": iso(start)}
+        if end is not None:
+            payload["endTimestamp"] = iso(end)
+        return self._post("Order/search", payload).get("orders") or []
 
     def search_open_orders(self, account_id: int) -> list[dict]:
         return self._post("Order/searchOpen", {"accountId": account_id}).get("orders") or []
