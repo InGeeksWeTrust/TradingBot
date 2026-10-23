@@ -70,6 +70,7 @@ class AccountConfig:
 @dataclass
 class SafetyConfig:
     live_trading_enabled: bool = False  # live orders also need --live on the command line
+    required_confirm_symbol: str = ""   # frozen test: refuse to start unless confirm_symbol is exactly this
     state_dir: str = "state"            # SQLite order/level/day state (one file per mode)
     halt_file: str = "HALT"             # create to stop NEW entries (open trades stay protected)
     bars_max_age_s: float = 180.0       # newest completed 1-min bar older than this = stale

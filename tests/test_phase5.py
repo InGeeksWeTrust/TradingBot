@@ -1,7 +1,7 @@
 """Phase 5 execution-safety tests: fault injection against the real Session loop (tests/fakes.py).
 Every test runs in pytest's tmp_path: its own state database, journal, logs and kill-switch files."""
 import sqlite3
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 
 import pytest
 
@@ -141,7 +141,7 @@ def test_11_restart_with_entry_order_still_pending_cancels_it(tmp_path):
     clock = FakeClock(datetime.combine(DAY, time(9, 45), ET))
     broker = FakeBroker(clock)
     cfg = make_cfg(tmp_path)
-    store = StateStore(tmp_path / "state" / "paper.sqlite")
+    store = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: clock().astimezone(timezone.utc))
     store.create_intent("sweep-x", DAY, CID, "short", 5, {"stop_pts": 20.25, "target_pts": 40.5}, ["pdh"], ["short"])
     store.set_state("sweep-x", "SUBMITTING", "CREATED")
     store.set_state("sweep-x", "ACKNOWLEDGED", "SUBMITTING", broker_order_id=500)
@@ -336,7 +336,8 @@ def test_20_temporary_api_outage_while_in_a_position(tmp_path):
 
 # ---------------------------------------------------------------- state machine, modes, isolation
 def test_state_machine_rejects_illegal_transitions(tmp_path):
-    store = StateStore(tmp_path / "s.sqlite")
+    fixed = datetime.combine(DAY, time(9, 45), ET)
+    store = StateStore(tmp_path / "s.sqlite", clock=lambda: fixed)
     from orbbot.execution import ExecutionEngine
     from orbbot.config import SafetyConfig
     eng = ExecutionEngine(None, store, 1, None, SafetyConfig())
@@ -394,3 +395,103 @@ def test_api_error_ambiguity_classification():
     assert ApiError("Order/place", 2, "customTag must be unique").ambiguous
     assert not ApiError("Order/place", 2, "Invalid size").ambiguous
     assert not ApiError("Order/place", 5, "Outside trading hours").ambiguous
+
+
+# ---------------------------------------------------------------- review round 2
+def test_21_real_paper_broker_survives_a_restart(tmp_path):
+    """The actual PaperClient (not the fake broker): its simulated account is on disk, so a restarted
+    bot finds the same position and bracket, verifies it, and the exit is still recorded."""
+    from orbbot.paper import PaperClient
+    clock = FakeClock(datetime.combine(DAY, time(9, 30, 30), ET))
+    market = FakeBroker(clock)                         # only supplies accounts, contracts and bars
+    path = tmp_path / "state" / "paper_broker.json"
+    paper = PaperClient(market, fee_per_contract_rt=1.22, state_path=path, clock=clock)
+    sc = Scenario(tmp_path, broker=paper, clock=clock)
+    sc.run_until(9, 45, 30)
+    tag = sc.bot.store.forward_rows()[0]["tag"]
+    assert sc.states(tag)[-1] == "PROTECTED" and paper.pos["size"] == 5
+    sc.close()
+    del paper                                          # the process dies; only the files remain
+    clock.advance(120)
+    paper2 = PaperClient(market, fee_per_contract_rt=1.22, state_path=path, clock=clock)
+    assert paper2.pos["size"] == 5 and len(paper2.orders) == 2
+    sc2 = Scenario(tmp_path, broker=paper2, clock=clock)
+    assert sc2.eng.active["tag"] == tag and sc2.eng.active["state"] == "PROTECTED"
+    base = market.price_fn                             # price falls through the short's target
+    market.price_fn = lambda t: (19900, 19905, 19895, 19900) if t.astimezone(ET).time() >= time(9, 48) else base(t)
+    sc2.run_until(9, 50)
+    assert paper2.pos is None and sc2.states(tag)[-1] == "CLOSED"
+    rows = sc2.bot.store.forward_rows()
+    assert rows[0]["exit_reason"] == "target" and rows[0]["fill_source"] == "paper-sim"
+    assert rows[0]["modeled_slippage_ticks"] == 1 and len(sc2.bot.journal.rows()) == 1
+    assert len([o for o in paper2.history if o["type"] == ORDER_MARKET]) == 1     # never re-entered
+
+
+def test_21b_paper_state_file_is_atomic_and_never_silently_reset(tmp_path):
+    from orbbot.paper import PaperClient
+    path = tmp_path / "paper_broker.json"
+    path.write_text("{ half a fil")
+    with pytest.raises(SystemExit, match="unreadable"):
+        PaperClient(None, state_path=path)
+
+
+@pytest.mark.parametrize("race", ["race_bracket_first", "race_stop_after"])
+def test_22_close_contract_racing_a_bracket_fill(tmp_path, race):
+    sc = Scenario(tmp_path)
+    sc.run_until(9, 45, 30)
+    assert sc.states()[-1] == "PROTECTED"
+    sc.broker.close_mode = race
+    (tmp_path / "STOP").write_text("")                 # emergency flatten while the bracket is live
+    sc.run_until(9, 46)
+    assert sc.broker.pos() is None                     # flat in the end, whichever filled first
+    assert not [o for o in sc.broker.orders if o["status"] == STATUS_OPEN and o["type"] != ORDER_MARKET]
+    assert len(entries(sc)) == 1                       # no order other than closeContract was ever sent
+    if race == "race_stop_after":
+        assert getattr(sc.broker, "reversed", False)   # the leftover stop did reverse us...
+        assert sc.broker.close_calls == 2              # ...and the verify loop closed that too
+
+
+def test_23_confirmation_market_cannot_be_substituted(tmp_path):
+    cfg = make_cfg(tmp_path)
+    cfg.confirm_symbol = "MES"
+    cfg.safety.required_confirm_symbol = "ES"
+    with pytest.raises(SystemExit, match="must be ES"):
+        ORBBot(cfg, mode="paper", api=FakeBroker(FakeClock(datetime.combine(DAY, time(9, 30), ET))))
+    cfg.confirm_symbol = "ES"                          # ES missing at the broker: refuse, don't fall back
+    b = ORBBot(cfg, mode="paper", api=FakeBroker(FakeClock(datetime.combine(DAY, time(9, 30), ET))))
+    with pytest.raises(SystemExit, match="No active ES contract"):
+        b.connect()                                    # the fake only lists MNQZ6; MESZ6 would not match ^ES
+
+
+def test_24_end_of_day_balance_only_after_the_310_pm_ct_close(tmp_path):
+    from orbbot.config import AccountConfig
+    from orbbot.execution import AccountGuard
+    from zoneinfo import ZoneInfo
+    ct = ZoneInfo("America/Chicago")
+    store = StateStore(tmp_path / "a.sqlite", clock=lambda: datetime.combine(DAY, time(16, 0), ct))
+    g = AccountGuard(AccountConfig(max_loss_limit=2000, start_balance=50_000, safety_buffer=500), store)
+    assert g.floor() == 48_000
+    assert not g.end_of_day(DAY, 51_000, datetime.combine(DAY, time(10, 55), ct))   # 11:55 ET: too early
+    assert g.floor() == 48_000
+    assert g.end_of_day(DAY, 51_000, datetime.combine(DAY, time(15, 11), ct))       # after the close
+    assert g.floor() == 49_000                                                         # trails up 1,000
+    assert not g.end_of_day(DAY, 52_500, datetime.combine(DAY, time(15, 40), ct))   # once per day
+    nxt = DAY + timedelta(days=3)
+    assert g.end_of_day(nxt, 52_500, datetime.combine(nxt, time(15, 20), ct))
+    assert g.floor() == 50_000                                                         # locks at start
+    g.update_balance(50_400)
+    assert g.headroom(0.0) == 50_400 - 50_000 - 500                                    # inside the buffer
+
+
+def test_25_old_state_files_gain_the_new_forward_columns(tmp_path):
+    import sqlite3 as sq
+    p = tmp_path / "old.sqlite"
+    from orbbot.state import FORWARD_ADDED, SCHEMA
+    db = sq.connect(p)
+    db.executescript(SCHEMA)                       # the schema as released on Oct 22 (no new columns)
+    db.commit()
+    assert not {r[1] for r in db.execute("PRAGMA table_info(forward)")} & set(FORWARD_ADDED)
+    db.close()
+    s = StateStore(p)
+    s.forward("t", fill_source="paper-sim", market_drift_ticks=2.0)
+    assert s.forward_rows()[0]["fill_source"] == "paper-sim"

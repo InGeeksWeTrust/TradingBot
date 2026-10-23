@@ -25,8 +25,9 @@ import logging
 import time as _time
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 from .api import (ORDER_MARKET, ORDER_STOP, ORDER_STOP_LIMIT, ORDER_TRAILING_STOP, SIDE_BUY, SIDE_SELL,
                   STATUS_CANCELLED, STATUS_EXPIRED, STATUS_FILLED, STATUS_OPEN, STATUS_PENDING,
@@ -52,6 +53,8 @@ class S(str, Enum):
 
 
 TERMINAL = {S.CLOSED, S.CANCELLED, S.REJECTED}
+CT = ZoneInfo("America/Chicago")
+TOPSTEP_DAY_END = time(15, 10)   # Topstep trading day: 5:00 PM CT to 3:10 PM CT
 ALLOWED = {
     S.CREATED: {S.SUBMITTING, S.CANCELLED},
     S.SUBMITTING: {S.ACKNOWLEDGED, S.REJECTED, S.UNKNOWN, S.FILLED, S.PARTIALLY_FILLED},
@@ -154,12 +157,21 @@ class AccountGuard:
         if self.enabled and not self.a.start_balance and self.store.get("start_balance") is None:
             self.store.put("start_balance", balance)
 
-    def end_of_day(self, day: date, balance: float) -> None:
-        if self.store.get("last_eod_day") == day.isoformat():
-            return
+    def end_of_day(self, day: date, balance: float, now: datetime, approximate: bool = False) -> bool:
+        """Record day's end-of-day balance for the trailing limit. Topstep's trading day ends at
+        3:10 PM CT (help.topstep.com, Daily Loss Limit article), so a balance only counts as
+        end-of-day once that time has passed for `day`; before it, nothing is recorded."""
+        eod = datetime.combine(day, TOPSTEP_DAY_END, CT)
+        if now.astimezone(CT) < eod:
+            return False
+        if self.store.get("last_eod_day") and self.store.get("last_eod_day") >= day.isoformat():
+            return False
         peak = self.store.get("peak_eod_balance", self.start_balance() or balance)
         self.store.put("peak_eod_balance", max(peak, balance))
         self.store.put("last_eod_day", day.isoformat())
+        self.store.event("eod_balance", f"{day}: {balance:.2f}{' (approximate: taken after the fact)' if approximate else ''}"
+                                        f" -> floor {self.floor()}")
+        return True
 
     def headroom(self, open_pnl: float) -> float | None:
         """Equity above floor + buffer (None = unknown -> no entries)."""
@@ -430,9 +442,16 @@ class ExecutionEngine:
         if sig_px is not None:
             slip = ((px - sig_px) if it["side"] == "long" else (sig_px - px)) / self.spec.tick_size
         sign = 1 if it["side"] == "long" else -1
+        # Paper fills are the real last price plus a MODELED slippage; only a broker fill measures real
+        # slippage. What paper does measure for real is the market's move between the signal bar's close
+        # and the fill (latency drift) = total - modeled.
+        modeled = float(getattr(self.api, "slip_ticks", 0)) if self.mode == "paper" else None
+        drift = (slip - modeled) if (slip is not None and modeled is not None) else slip
         self.store.forward(it["tag"], fill_time=self.clock().isoformat(), fill_price=px, fill_qty=int(pos["size"]),
                            stop_price=px - sign * plan.get("stop_pts", 0), target_price=px + sign * plan.get("target_pts", 0),
-                           entry_slippage_ticks=slip)
+                           entry_slippage_ticks=slip, fill_source="paper-sim" if self.mode == "paper" else "broker",
+                           modeled_slippage_ticks=modeled, market_drift_ticks=drift,
+                           confirm_contract=getattr(self, "confirm_contract", None))
 
     # ---------------- unexpected exposure
     def check_unexpected(self) -> str | None:

@@ -202,9 +202,21 @@ class FakeBroker:
             raise ApiError("Position/closeContract", 2, "rejected")
         if self.close_mode == "timeout":
             raise Down("read timeout")
+        px = self.price_fn(self.clock().astimezone(ET).replace(second=0, microsecond=0))[3]
+        if self.close_mode == "race_bracket_first":     # the stop fills a moment before our close arrives
+            self.close_mode = "ok"
+            stop = next(o for o in self.orders if o["type"] == ORDER_STOP and o["status"] == STATUS_OPEN)
+            self.exit_position(stop["stopPrice"], self.pos()["size"], leg=stop)
+            raise ApiError("Position/closeContract", 2, "No open position")
         p = next((p for p in self.positions if p["contractId"] == contract_id), None)
         if p:
-            self.exit_position(self.price_fn(self.clock().astimezone(ET).replace(second=0, microsecond=0))[3], p["size"])
+            self.exit_position(px, p["size"])
+        if self.close_mode == "race_stop_after":        # closed, but the still-working stop then triggers
+            self.close_mode = "ok"
+            stop = next(o for o in self.orders if o["type"] == ORDER_STOP and o["status"] == STATUS_OPEN)
+            stop["status"], stop["fillVolume"] = STATUS_FILLED, stop["size"]
+            self.add_position(stop["size"], stop["stopPrice"], long=stop["side"] == 0)   # opens the other way
+            self.reversed = True
 
     def exit_position(self, price, qty, leg=None):
         """Reduce/close the position at `price` (a bracket fill or a close)."""

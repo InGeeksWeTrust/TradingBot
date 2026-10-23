@@ -27,8 +27,9 @@ import logging
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .api import ProjectXClient
 from .config import BotConfig, load_config
@@ -42,6 +43,7 @@ from .state import StateError, StateStore
 from .strategy import ET, Bar, ORBStrategy
 
 log = logging.getLogger("orbbot")
+CT = ZoneInfo("America/Chicago")
 MONTHS = "FGHJKMNQUVXZ"
 
 
@@ -54,6 +56,10 @@ class ORBBot:
                  clock=None, sleep=None):
         if mode not in ("paper", "live", "readonly"):
             raise ValueError(mode)
+        req = cfg.safety.required_confirm_symbol
+        if req and cfg.confirm_symbol.upper() != req.upper():
+            raise SystemExit(f"Frozen forward test: confirm_symbol must be {req} (config has "
+                             f"'{cfg.confirm_symbol}'). The bot will not substitute another market.")
         if mode == "live" and not cfg.safety.live_trading_enabled:
             raise SystemExit("Live trading is disabled. Set safety.live_trading_enabled: true in the config "
                              "AND pass --live to send real orders. Use --dry-run to paper trade.")
@@ -66,7 +72,9 @@ class ORBBot:
             raise ValueError(f"contracts must be 1..{cfg.risk.max_contracts}")
         if api is None:
             real = ProjectXClient(cfg.username, cfg.api_key, cfg.base_url)
-            api = PaperClient(real, fee_per_contract_rt=cfg.risk.fee_per_contract_rt) if mode == "paper" else real
+            api = (PaperClient(real, fee_per_contract_rt=cfg.risk.fee_per_contract_rt,
+                               state_path=Path(cfg.safety.state_dir) / "paper_broker.json", clock=self.clock)
+                   if mode == "paper" else real)
         self.api = api
         store_name = "paper" if mode == "paper" else "live"  # read-only inspects the live state
         self.store = StateStore(Path(cfg.safety.state_dir) / f"{store_name}.sqlite",
@@ -159,12 +167,29 @@ class ORBBot:
                 if once:
                     return
                 continue
+            self.eod_snapshot(now)
             if once and (not self.is_trading_day(today) or now >= end or self.done_day == today):
                 log.info("--once: no session to run today (%s). Exiting.", today)
                 return
             nxt = prep if now < prep and self.done_day != today else prep + timedelta(days=1)
+            eod = datetime.combine(today, dtime(15, 15), CT).astimezone(ET)   # wake for the EOD balance
+            if self.is_trading_day(today) and now < eod < nxt:
+                nxt = eod
             log.info("Idle. Next session check at %s ET", nxt.strftime("%a %Y-%m-%d %H:%M"))
             self.sleep(min(max((nxt - self.clock()).total_seconds(), 5), 900))
+
+    def eod_snapshot(self, now: datetime) -> None:
+        """Between 3:10 PM CT (end of Topstep's trading day) and 5:00 PM CT, record today's balance
+        as the end-of-day balance that moves the Maximum Loss Limit."""
+        ct = now.astimezone(CT)
+        if not (self.cfg.account.max_loss_limit > 0 and self.is_trading_day(ct.date())
+                and dtime(15, 10) <= ct.time() < dtime(17, 0)):
+            return
+        try:
+            acct = next(a for a in self.api.search_accounts() if a["id"] == self.account_id)
+            AccountGuard(self.cfg.account, self.store).end_of_day(ct.date(), float(acct["balance"]), now)
+        except Exception as e:  # noqa: BLE001
+            log.warning("End-of-day balance snapshot failed: %s", e)
 
     def run_session(self, day: date) -> None:
         sess = Session(self, day)
@@ -244,6 +269,10 @@ class Session:
             self.engine.block("state_lost", "state database was unreadable at start-up; no entries this session")
         self.refresh_account(force=True)
         self.refresh_realized(force=True)
+        self._catch_up_eod()
+        if b.confirm_spec:
+            self.engine.confirm_contract = b.confirm_spec.contract_id
+            self.store.event("session_start", f"confirmation contract {b.confirm_spec.contract_id}")
         action = self.engine.recover(self.day, self.fresh, self.expected_stop)
         if action == "flatten":
             self.do_flatten("start-up: open position without verified protection")
@@ -255,6 +284,19 @@ class Session:
             self.strat.reset(self.day)
             self.inner = self.strat
             self._preload()
+
+    def _catch_up_eod(self) -> None:
+        """If the bot wasn't running at the previous trading day's close, record the balance now as that
+        day's end-of-day balance (valid because the bot never trades between sessions), flagged as
+        approximate; copy the floor from the dashboard into account.mll_floor if they disagree."""
+        if not self.acct.enabled or self.acct.balance is None:
+            return
+        prev = self.day - timedelta(days=1)
+        while not self.bot.is_trading_day(prev):
+            prev -= timedelta(days=1)
+        last = self.store.get("last_eod_day")
+        if last is None or last < prev.isoformat():
+            self.acct.end_of_day(prev, self.acct.balance, self.utc(), approximate=True)
 
     def _preload(self) -> None:
         """Restore what the strategy already did today (levels used, trades taken)."""
@@ -469,8 +511,6 @@ class Session:
                     except Exception as e:  # noqa: BLE001
                         log.warning("Cancel %s failed: %s", o.get("id"), e)
             self.refresh_account(force=True)
-            if self.acct.balance is not None:
-                self.acct.end_of_day(self.day, self.acct.balance)
             self.refresh_realized(force=True)
             log.info("=== Session over. Realized $%.2f ===", self.realized)
             return "done"

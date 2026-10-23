@@ -9,9 +9,8 @@
 
 symbol: MNQ
 entry: sweep              # 5-min wick through the prior-day or overnight high/low that closes back -> fade
-confirm_symbol: ES        # ES must be on the trade's side of its session VWAP. ES is what every backtest
-                          # used; until 2026-10-22 the paper bot used MES (same index, different volume
-                          # weights). Check the log shows "Contract ESZ6"; if ES isn't offered, set MES.
+confirm_symbol: ES        # FROZEN: ES must be on the trade's side of its session VWAP (what every backtest
+                          # used). If ES can't be found the bot refuses to start; it never substitutes MES.
 history_days: 6
 account_name: "PRAC-V2-387652-21891938"
 poll_seconds: 5
@@ -69,6 +68,7 @@ account:                  # Topstep Maximum Loss Limit guard. A practice account
 
 safety:
   live_trading_enabled: false
+  required_confirm_symbol: ES   # frozen forward test: refuse to start with any other confirmation market
   state_dir: state        # state/paper.sqlite: order intents, levels used, events, forward-test record
   halt_file: HALT         # create a file named HALT: no NEW entries, open trade stays managed
   bars_max_age_s: 180

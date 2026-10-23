@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS forward (
     equity_before REAL, equity_after REAL, mode TEXT
 );
 """
+# columns added after the first release; added to existing files on open
+FORWARD_ADDED = {"fill_source": "TEXT", "modeled_slippage_ticks": "REAL", "market_drift_ticks": "REAL",
+                 "confirm_contract": "TEXT"}
 
 
 def utcnow() -> str:
@@ -90,6 +93,10 @@ class StateStore:
             if ok != "ok":
                 raise sqlite3.DatabaseError(ok)
             db.executescript(SCHEMA)
+            have = {r[1] for r in db.execute("PRAGMA table_info(forward)")}
+            for col, typ in FORWARD_ADDED.items():
+                if col not in have:
+                    db.execute(f"ALTER TABLE forward ADD COLUMN {col} {typ}")
             db.execute("PRAGMA journal_mode=WAL")
             return db
         except sqlite3.DatabaseError as e:
@@ -107,6 +114,8 @@ class StateStore:
             self.recovered_from_corruption = True
             db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             db.executescript(SCHEMA)
+            for col, typ in FORWARD_ADDED.items():
+                db.execute(f"ALTER TABLE forward ADD COLUMN {col} {typ}")
             self._event_on(db, "state_recovered", f"corrupt file moved to {bad.name}: {e}")
             return db
 

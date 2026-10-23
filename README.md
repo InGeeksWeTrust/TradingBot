@@ -252,6 +252,22 @@ if equity enters it.
 
 **Kill switches.** File `HALT`: no new entries, an open trade stays managed. File `STOP`: flatten and halt.
 
+**Paper broker durability.** The simulated account (position, working and past orders, fills, used
+tags) is saved atomically to `state/paper_broker.json` after every change, so a restarted paper bot
+reconciles against the same state a real account would show; fills that would have happened while it
+was down are applied when the missed bars replay. An unreadable file stops the bot rather than
+silently starting from flat.
+
+**End of day.** The trailing Maximum Loss Limit moves with Topstep's end-of-day balance, and Topstep's
+trading day ends at 3:10 PM CT. The bot records the balance between 3:10 and 5:00 PM CT (it stays
+running and wakes for it); if it wasn't running then, it records the balance at the next start and
+flags it as approximate. If the dashboard shows a different floor, set `account.mll_floor` to it.
+
+**Forward-test record.** Paper fills are the real last price plus a modeled 1-tick slippage, so the
+record keeps `fill_source` (paper-sim / broker), `modeled_slippage_ticks`, and `market_drift_ticks` (the
+real market move between the signal bar's close and the fill). Real broker slippage can only be measured
+on a broker account.
+
 ## Contract rolls and the entry cutoff (2026-10-22)
 
 **Rolls.** Databento's `.v.0` series switches contract at an evening open, so on 8 sessions a year the
