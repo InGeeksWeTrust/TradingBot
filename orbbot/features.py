@@ -75,8 +75,11 @@ def _agg4h(bars: list[Bar]) -> list[tuple[datetime, Bar]]:
 
 class Features:
     def __init__(self, bars: list[Bar], open_t: time = time(9, 30), close_t: time = time(16, 0),
-                 swing_n: int = 2):
+                 swing_n: int = 2, level_bars: list[Bar] | None = None):
+        """`level_bars`: extra bars (e.g. the incoming contract around each roll, downloaded per
+        contract) used only for prior-day / overnight levels, never traded."""
         bars = sorted(bars, key=lambda b: b.t)
+        self._extra = sorted(level_bars or [], key=lambda b: b.t)
         self.open_t, self.close_t = open_t, close_t
         self._hourly(bars)
         self._five_ind(bars)
@@ -247,7 +250,8 @@ class Features:
         return None
 
     # ------------------------------------------------------------- session levels
-    def _levels(self, bars):
+    def _split(self, bars):
+        """RTH bars by date, and overnight bars keyed to the morning they lead into."""
         rth: dict[date, list[Bar]] = {}
         onx: dict[date, list[Bar]] = {}
         for b in bars:
@@ -260,16 +264,68 @@ class Features:
             elif tt < self.open_t:
                 onx.setdefault(t.date(), []).append(b)
         # weekend: Sunday-evening bars are keyed to Monday already; Friday-evening has none
+        return rth, onx
+
+    def _levels(self, bars):
+        """Prior-day RTH high/low/close and overnight high/low, taken ONLY from the contract that
+        trades in the session. A continuous series switches contract at an evening open, so on a
+        roll session the prior day (and the first hours of the overnight) belong to the expiring
+        contract, a calendar spread away (~200-300 MNQ pts). Those levels come from `level_bars` for
+        the new contract when supplied; otherwise they are left out (None) and noted in
+        `level_notes`. Bars without an instrument id (inst=0) are treated as one contract."""
+        rth, onx = self._split(bars)
+        x_rth: dict[int, dict] = {}
+        x_onx: dict[int, dict] = {}
+        by_inst: dict[int, list[Bar]] = {}
+        for b in self._extra:
+            by_inst.setdefault(b.inst, []).append(b)
+        for inst, bs in by_inst.items():
+            x_rth[inst], x_onx[inst] = self._split(bs)
         self.levels: dict[date, Levels] = {}
+        self.level_notes: dict[date, list[str]] = {}
+        self.roll_sessions: set[date] = set()
         prev = None
         for d in sorted(set(rth) | set(onx)):
             lv = Levels()
+            notes = []
+            ref = rth.get(d) or onx.get(d) or []
+            traded = ref[0].inst if d in rth and rth[d] else (ref[-1].inst if ref else 0)
             if prev is not None:
-                pb = rth[prev]
-                lv.pdh, lv.pdl, lv.pdc = max(b.h for b in pb), min(b.l for b in pb), pb[-1].c
+                pb = [b for b in rth[prev] if b.inst == traded]
+                if len(pb) < len(rth[prev]):          # prior day was on another contract
+                    self.roll_sessions.add(d)
+                    alt = x_rth.get(traded, {}).get(prev, [])
+                    if len(alt) >= 0.5 * len(rth[prev]):  # a real session of the new contract
+                        pb = alt
+                        notes.append(f"prior-day levels from contract {traded} (roll fill)")
+                    else:
+                        pb = []
+                        notes.append(f"prior-day levels unavailable: {prev} RTH not in data for contract {traded}")
+                if pb:
+                    lv.pdh, lv.pdl, lv.pdc = max(b.h for b in pb), min(b.l for b in pb), pb[-1].c
             if d in onx and onx[d]:
-                lv.onh, lv.onl = max(b.h for b in onx[d]), min(b.l for b in onx[d])
+                ob = [b for b in onx[d] if b.inst == traded]
+                if len(ob) < len(onx[d]):             # overnight started on the old contract
+                    self.roll_sessions.add(d)
+                    fill = x_onx.get(traded, {}).get(d, [])
+                    first_main = min(b.t for b in onx[d])
+                    # the fill must reach back to the start of the overnight; a truncated overnight
+                    # range would make levels that the live bot (full contract history) never sees
+                    if fill and min(b.t for b in fill) <= first_main + timedelta(minutes=5):
+                        have = {b.t: b for b in ob}
+                        for b in fill:
+                            have.setdefault(b.t, b)
+                        ob = list(have.values())
+                        notes.append(f"overnight levels from contract {traded} (roll fill)")
+                    else:
+                        ob = []
+                        notes.append(f"overnight levels unavailable: the first part of the overnight is "
+                                     f"not in data for contract {traded}")
+                if ob:
+                    lv.onh, lv.onl = max(b.h for b in ob), min(b.l for b in ob)
             self.levels[d] = lv
+            if notes:
+                self.level_notes[d] = notes
             if d in rth and rth[d]:
                 prev = d
 

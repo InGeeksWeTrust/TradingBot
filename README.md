@@ -196,6 +196,55 @@ MNQ and MES until 11:30 ET and is flat by 11:55. Trades go to `journal\paper.xls
 It did NOT fully pass the holdout test (p 0.03, drawdown $2,115 on 2024-25); paper results are the
 next piece of evidence, not a green light for real money.
 
+### Intraday levels (research variants, off in the live bot)
+
+| name | levels it can sweep |
+|---|---|
+| `sweep` | prior-day high/low, overnight high/low (what the live bot uses) |
+| `sweep_or` | + opening-range high/low (9:30-9:45 ET), live from 9:45 |
+| `sweep_swing` | + 5-minute swing highs/lows that have held untouched for 60+ minutes |
+| `sweep_all` | both |
+
+A swing high is a 5-minute bar whose high beats the two bars before and after it. If price breaks
+it before it is an hour old, or closes through it, it's gone. Each level still trades once a day.
+
+```powershell
+python -m orbbot.research --csv data\mnq_all.csv --confirm-csv data\es_all.csv --strategies sweep sweep_or sweep_swing sweep_all --filters none es
+```
+Only if one beats plain `sweep` in both TRAIN and TEST, run it on the holdout, then turn it on in
+`config-sweep.yaml` with `sweep_extra: [or]` (or `[swing]`, or `[or, swing]`).
+
+## Contract rolls and the entry cutoff (2026-10-22)
+
+**Rolls.** Databento's `.v.0` series switches contract at an evening open, so on 8 sessions a year the
+prior-day high/low (and the first hours of the overnight) belong to the expiring contract, 200-300 MNQ
+points away. Levels are now built only from the contract that trades that session. CSVs need the
+`instrument_id` column for this; rebuild yours from the cached downloads (free):
+```powershell
+python -m orbbot.databento_fetch --from-cache data\MNQ_v_0_2025-10-20_2026-10-21.dbn.zst --all-hours --out data\mnq_all.csv
+```
+(repeat for the other `.dbn.zst` files). Without extra data, roll sessions have no sweep levels and are
+skipped (printed at the start of a research run). To trade them in backtests with the right contract's
+levels, download the incoming contract around each roll (priced first, asks y/N):
+```powershell
+python -m orbbot.databento_fetch --roll-fill data\MNQ_v_0_2025-10-20_2026-10-21.dbn.zst --out data\mnq_rollfill.csv
+python -m orbbot.research --csv data\mnq_all.csv --level-csv data\mnq_rollfill.csv ...
+```
+The live bot reads the current contract's own history from TopstepX, so it was never affected.
+
+**Entry cutoff.** `strategy.entry_cutoff` is now the one setting for the last entry in backtest, paper
+and live, for ORB and sweep alike (a signal bar must close at or before it; the bot also refuses to send
+an entry more than 2 minutes after it). Before this, the sweep ignored it and always used 11:30 ET.
+`config-sweep.yaml` sets 11:30 explicitly so the strategy is unchanged. To reproduce the pre-fix sweep
+research with `config.yaml` (11:00), pass `--entry-cutoff 11:30` to `orbbot.research`.
+
+## Cost-inclusive sizing (2026-10-22)
+
+`risk.size_with_costs: true` sizes each trade so the structural stop **plus** `est_slippage_ticks`
+on entry and stop **plus** round-trip fees fits inside `max_risk_per_trade` (default off, which keeps
+the old behaviour: only the stop distance counts). The stop itself is never moved; only the contract
+count changes, and a signal is skipped when even 1 contract doesn't fit.
+
 ## Scalping mode: fixed $ take-profit, many trades, daily cap
 
 ```powershell

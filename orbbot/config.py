@@ -20,7 +20,7 @@ class StrategyConfig:
     or_start: time = time(9, 30)
     or_minutes: int = 15               # opening range length
     signal_tf_minutes: int = 5         # breakout is confirmed on the close of this bar size
-    entry_cutoff: time = time(11, 0)   # no new entries after this
+    entry_cutoff: time = time(11, 0)   # last signal time for ORB AND sweep entries (signal bar close <= this)
     flatten_time: time = time(11, 55)  # force flat
     breakout_buffer_ticks: int = 0     # close must exceed OR high/low by this many ticks
     min_range_points: float = 10.0     # skip day if OR narrower than this
@@ -41,6 +41,8 @@ class RiskConfig:
     fixed_stop_points: float = 12.5
     max_risk_per_trade: float = 250.0  # stop is tightened (capped) to keep risk at/below this
     min_stop_ticks: int = 8            # TopstepX rejects brackets of 5 ticks or fewer
+    size_with_costs: bool = False      # True: size so stop $ + est. slippage + fees <= max_risk_per_trade
+    est_slippage_ticks: int = 1        # per side (entry, stop) used when size_with_costs is on
     reward_risk: float = 2.0           # used only when target_per_trade is 0
     target_per_trade: float = 550.0    # $ target at full size; sets R = target / max_risk_per_trade
     target_usd: float = 0.0            # >0: every trade takes profit at this many $, whatever its size
@@ -59,7 +61,8 @@ class BotConfig:
     symbol: str = "MNQ"
     entry: str = "orb"                 # entry rule for the live bot: orb | sweep
     confirm_symbol: str = ""           # sweep: second market that must agree (MES for MNQ); blank = off
-    history_days: int = 6              # sweep: days of 1-min history loaded for prior-day/overnight levels
+    sweep_extra: list[str] = field(default_factory=list)  # sweep: also intraday levels: or, swing
+    history_days: int = 6             # sweep: days of 1-min history loaded for prior-day/overnight levels
     account_name: str = ""             # exact account name/id as shown in TopstepX
     base_url: str = "https://api.topstepx.com"
     poll_seconds: float = 5.0
@@ -118,5 +121,8 @@ def validate(cfg: BotConfig) -> None:
     assert r.stop_mode in {"dollar", "opposite", "mid", "fixed", "structural"}
     assert r.max_daily_loss > 0 and r.max_daily_profit > 0
     assert r.min_stop_ticks >= 6, "TopstepX rejects brackets of 5 ticks or fewer"
-    assert s.entry_cutoff < s.flatten_time
+    assert r.est_slippage_ticks >= 0 and r.max_risk_per_trade > 0
+    assert s.entry_cutoff < s.flatten_time, "entry_cutoff must be before flatten_time"
+    assert s.entry_cutoff > s.or_start, "entry_cutoff must be after the session open"
     assert cfg.entry in {"orb", "sweep"}, "entry must be orb or sweep"
+    assert set(cfg.sweep_extra) <= {"or", "swing"}, "sweep_extra may only contain: or, swing"

@@ -319,13 +319,25 @@ class MTF(_Five):
 
 class Sweep(_Five):
     """Price runs through prior-day / overnight high or low, then a 5-min bar closes back
-    on the other side -> reverse. Stop beyond the sweep's extreme."""
+    on the other side -> reverse. Stop beyond the sweep's extreme.
+
+    `extra` adds levels that form during the session itself:
+      "or"    - opening-range high/low (first `or_minutes`), live once the range is complete
+      "swing" - a 5-min swing high/low (2 bars each side) that has held, untouched, for at
+                least `swing_age` minutes. A swing that gets taken out without a reclaim is gone.
+    """
     name = "sweep"
 
-    def __init__(self, cfg, tick, feats, window="am", session=NASDAQ, max_trades=2, reentry=False, **_):
+    def __init__(self, cfg, tick, feats, window="am", session=NASDAQ, max_trades=2, reentry=False,
+                 extra=(), or_minutes=15, swing_age=60, **_):
         self.tick, self.f, self.s = tick, feats, session
-        self.last_entry = session.windows[window][0]
+        # The configured entry_cutoff is authoritative (backtest, paper and live all pass the same
+        # StrategyConfig). Before 2026-10-22 this used the session window (11:30 ET) and ignored it.
+        self.last_entry = getattr(cfg, "entry_cutoff", None) or session.windows[window][0]
         self.max_n, self.reentry = max_trades, reentry
+        self.extra = set(extra)
+        assert self.extra <= {"or", "swing"}, f"unknown sweep levels: {self.extra}"
+        self.or_minutes, self.swing_age = or_minutes, timedelta(minutes=swing_age)
 
     def reset(self, day):
         self._five_reset()
@@ -333,25 +345,69 @@ class Sweep(_Five):
         lv = self.f.day_levels(day)
         self.highs = [("pdh", lv.pdh), ("onh", lv.onh)]
         self.lows = [("pdl", lv.pdl), ("onl", lv.onl)]
+        self.open_dt = datetime.combine(day, self.s.open, ET)
+        self.or_end = self.open_dt + timedelta(minutes=self.or_minutes)
+        self.or_hi = self.or_lo = None
+        self.sess5: list[Bar] = []                 # completed 5-min bars since the open
+        self.swing_hi: list[tuple] = []            # (name, price, formed_at) still untouched
+        self.swing_lo: list[tuple] = []
 
     def register_entry(self, side):
         self.n += 1
+
+    def _session_levels(self, c5):
+        """Intraday levels allowed to be swept by the 5-min bar `c5` (all formed before it)."""
+        hi, lo = [], []
+        if "or" in self.extra and self.or_hi is not None and c5.t >= self.or_end:
+            hi.append(("orh", self.or_hi))
+            lo.append(("orl", self.or_lo))
+        if "swing" in self.extra:
+            hi += [(n, p) for n, p, at in self.swing_hi if c5.t - at >= self.swing_age]
+            lo += [(n, p) for n, p, at in self.swing_lo if c5.t - at >= self.swing_age]
+        return hi, lo
+
+    def _track_swings(self, c5):
+        """After a bar is checked: drop swings it took out, then confirm a new pivot two bars back."""
+        self.swing_hi = [s for s in self.swing_hi if c5.h <= s[1]]
+        self.swing_lo = [s for s in self.swing_lo if c5.l >= s[1]]
+        self.sess5.append(c5)
+        if len(self.sess5) < 5:
+            return
+        w = self.sess5[-5:]
+        p = w[2]
+        formed = p.t + timedelta(minutes=5)
+        tag = formed.strftime("%H%M")
+        if p.h > max(w[0].h, w[1].h) and p.h >= max(w[3].h, w[4].h):
+            self.swing_hi.append((f"sh{tag}", p.h, formed))
+        if p.l < min(w[0].l, w[1].l) and p.l <= min(w[3].l, w[4].l):
+            self.swing_lo.append((f"sl{tag}", p.l, formed))
 
     def on_bar(self, b: Bar):
         t = b.t.astimezone(ET)
         if t.date() != self.day:
             self.reset(t.date())
+        if self.open_dt <= t < self.or_end:
+            self.or_hi = b.h if self.or_hi is None else max(self.or_hi, b.h)
+            self.or_lo = b.l if self.or_lo is None else min(self.or_lo, b.l)
         done = self._five(b)
         if not done:
             return None
         c5, ct = done
+        c5 = Bar(c5.t, c5.o, c5.h, c5.l, c5.c, c5.v)  # snapshot, the aggregator reuses its object
+        sig = self._check(c5, ct)
+        if c5.t >= self.open_dt and "swing" in self.extra:
+            self._track_swings(c5)
+        return sig
+
+    def _check(self, c5, ct):
         if self.n >= self.max_n or not (self.s.at(5) <= ct.time() <= self.last_entry):
             return None
-        for name, lvl in self.highs:
+        s_hi, s_lo = self._session_levels(c5) if self.extra else ([], [])
+        for name, lvl in self.highs + s_hi:
             if lvl is not None and (self.reentry or name not in self.used) and c5.h > lvl and c5.c < lvl:
                 self.used.add(name)
                 return Signal("short", ct, c5.c, c5.h + self.tick, c5.c)
-        for name, lvl in self.lows:
+        for name, lvl in self.lows + s_lo:
             if lvl is not None and (self.reentry or name not in self.used) and c5.l < lvl and c5.c > lvl:
                 self.used.add(name)
                 return Signal("long", ct, c5.c, c5.c, c5.l - self.tick)
@@ -622,6 +678,15 @@ def _crt(tf, target):
     return lambda cfg, tick, feats=None, **kw: CRT(cfg, tick, feats, tf=tf, target=target, **kw)
 
 
+def _hhmm(x: str):
+    h, m = x.split(":")
+    return time(int(h), int(m))
+
+
+def _sweep(*extra):
+    return lambda cfg, tick, feats=None, **kw: Sweep(cfg, tick, feats, extra=extra, **kw)
+
+
 def _legacy(cls, uses_session=False):
     if uses_session:
         return lambda cfg, tick, feats=None, session=NASDAQ, **_: cls(cfg, tick, session)
@@ -632,6 +697,7 @@ STRATEGIES = {
     "orb": _legacy(ORB), "orb_first": _legacy(ORBFirst, True), "fade": _legacy(Fade),
     "pullback": _legacy(Pullback, True),
     "mtf": MTF, "sweep": Sweep, "vwapband": VWAPBand, "gapfade": GapFade,
+    "sweep_or": _sweep("or"), "sweep_swing": _sweep("swing"), "sweep_all": _sweep("or", "swing"),
     "bbrev": BBRev, "bbmom": BBMom,
     "crt1h_mid": _crt(60, "mid"), "crt1h_range": _crt(60, "range"),
     "crt4h_mid": _crt(240, "mid"), "crt4h_range": _crt(240, "range"),
@@ -639,13 +705,14 @@ STRATEGIES = {
 }
 ZONE_NAMES = {"zone4r", "zone_runner"}
 CRT_NAMES = {"crt1h_mid", "crt1h_range", "crt4h_mid", "crt4h_range"}
-NEEDS_OVERNIGHT = {"mtf", "sweep", "gapfade", "bbrev", "bbmom"} | CRT_NAMES | ZONE_NAMES
+SWEEP_NAMES = {"sweep", "sweep_or", "sweep_swing", "sweep_all"}
+NEEDS_OVERNIGHT = SWEEP_NAMES | {"mtf", "gapfade", "bbrev", "bbmom"} | CRT_NAMES | ZONE_NAMES
 # (window, stop) combinations tested for each idea
 GRID = {
     "orb": [("am", "dollar")], "orb_first": [("am", "dollar")], "fade": [("am", "dollar")],
     "pullback": [("am", "dollar")],
     "mtf": [("am", "structural"), ("am", "dollar"), ("day", "structural"), ("day", "dollar")],
-    "sweep": [("am", "structural")],
+    **{n: [("am", "structural")] for n in SWEEP_NAMES},
     "vwapband": [("day", "structural")],
     "gapfade": [("am", "dollar")],
     "bbrev": [("am", "structural")],
@@ -920,6 +987,10 @@ def main() -> None:
     ap.add_argument("--slippage", type=int, default=1)
     ap.add_argument("--seeds", type=int, default=2000)
     ap.add_argument("--threshold", type=float, default=0.02, help="p(random) needed in every period to flag")
+    ap.add_argument("--entry-cutoff", metavar="HH:MM", help="last signal time (ET) for ORB and sweep entries; "
+                    "default: entry_cutoff in the config. The pre-2026-10-22 sweep results used 11:30")
+    ap.add_argument("--level-csv", nargs="+", default=[], help="extra per-contract bars used only for "
+                    "prior-day/overnight levels on roll days (from databento_fetch --roll-fill)")
     ap.add_argument("--holdout", action="store_true",
                     help="final check: treat the whole CSV as one untouched period (use with --only)")
     ap.add_argument("--only", nargs="+", metavar="LABEL", help='run only these variants, e.g. "mtf day struct 2.2R 10ct"')
@@ -933,6 +1004,8 @@ def main() -> None:
         cfg = dataclasses.replace(cfg, risk=dataclasses.replace(
             cfg.risk, max_daily_profit=a.profit_cap if a.profit_cap is not None else cfg.risk.max_daily_profit,
             max_daily_loss=a.loss_limit if a.loss_limit is not None else cfg.risk.max_daily_loss))
+    if a.entry_cutoff:
+        cfg = dataclasses.replace(cfg, strategy=dataclasses.replace(cfg.strategy, entry_cutoff=_hhmm(a.entry_cutoff)))
     spec = spec_for(a.symbol or cfg.symbol)
     if spec.contract_id in RANGE_FILTER and (a.symbol or cfg.symbol).upper() != cfg.symbol.upper():
         lo, hi = RANGE_FILTER[spec.contract_id]  # config.yaml's range filter is for a different market
@@ -942,6 +1015,8 @@ def main() -> None:
     grid = GRID_COMEX if session is COMEX else GRID
     print(f"Instrument {spec.contract_id} (${spec.point_value:g}/pt), {session.name} session: open "
           f"{session.open:%H:%M} ET, entries until {session.windows['am'][0]:%H:%M}, flat by {session.windows['am'][1]:%H:%M}")
+    if session is NASDAQ:
+        print(f"ORB and sweep entries until {cfg.strategy.entry_cutoff:%H:%M} ET (config entry_cutoff)")
     if (CRT_NAMES | ZONE_NAMES) & set(a.strategies) and "day" in session.windows:
         print(f"  (CRT and zone strategies use the full-session window: entries until {session.windows['day'][0]:%H:%M}, "
               f"flat by {session.windows['day'][1]:%H:%M})")
@@ -954,7 +1029,15 @@ def main() -> None:
                 "for free from your Databento download:\n  python -m orbbot.databento_fetch --from-cache "
                 "data\\MNQ_v_0_<dates>.dbn.zst --all-hours --out data\\mnq_all.csv")
         print("Building 1-hour, 15-minute and session-level context...")
-        feats = Features(bars, session.open, session.close)
+        extra = [b for f in a.level_csv for b in load_csv(f, a.csv_tz)]
+        feats = Features(bars, session.open, session.close, level_bars=extra)
+        if feats.roll_sessions:
+            print(f"Contract rolls in data: {', '.join(str(d) for d in sorted(feats.roll_sessions))}")
+            for d in sorted(feats.level_notes):
+                print(f"  {d}: " + "; ".join(feats.level_notes[d]))
+        elif not any(b.inst for b in bars[:100]):
+            print("Note: CSV has no instrument_id column, so contract rolls can't be detected. Rebuild it with "
+                  "python -m orbbot.databento_fetch --from-cache <file>.dbn.zst --all-hours --out <csv>")
 
     filters = list(a.filters)
     es = None

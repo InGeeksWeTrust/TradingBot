@@ -60,10 +60,60 @@ def write_session_csv(store, out: Path, keep_all: bool) -> tuple[int, str, str]:
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t", "o", "h", "l", "c", "v"])
+        w.writerow(["t", "o", "h", "l", "c", "v", "instrument_id"])  # instrument_id: which contract
         for ts, r in zip(df.index, df.itertuples(index=False)):
-            w.writerow([ts.isoformat(), r.open, r.high, r.low, r.close, int(r.volume)])
+            w.writerow([ts.isoformat(), r.open, r.high, r.low, r.close, int(r.volume), int(r.instrument_id)])
     return len(df), f"{et[0]:%Y-%m-%d}", f"{et[-1]:%Y-%m-%d}"
+
+
+def roll_windows(store) -> list[tuple[int, datetime, datetime]]:
+    """For each contract switch in a continuous download: (new instrument id, start, end) covering
+    the prior regular session and the overnight hours that the series still took from the old
+    contract. Those bars of the NEW contract are what the prior-day / overnight levels need."""
+    df = store.to_df()
+    ids = df["instrument_id"].to_numpy()
+    out = []
+    for i in range(1, len(df)):
+        if ids[i] != ids[i - 1]:
+            switch = df.index[i].to_pydatetime()
+            et = switch.astimezone(ET)
+            # prior RTH session = the last weekday before the switch's evening; start at its 9:30 ET
+            prior = et.date() if et.time() >= time(16, 0) else et.date() - timedelta(days=1)
+            while prior.weekday() >= 5:
+                prior -= timedelta(days=1)
+            start = datetime.combine(prior, time(9, 25), ET)
+            end = datetime.combine(et.date() + timedelta(days=1), time(9, 30), ET)  # through the next open
+            out.append((int(ids[i]), start, end))
+    return out
+
+
+def roll_fill(cache: str, out: Path, yes: bool) -> None:
+    """Download the incoming contract's bars around every roll in `cache` (priced first, asks y/N)."""
+    import databento as db
+    wins = roll_windows(db.DBNStore.from_file(cache))
+    if not wins:
+        raise SystemExit("No contract switches in that file; nothing to fill.")
+    client = _client()
+    reqs = [dict(dataset=DATASET, schema=SCHEMA, symbols=[str(i)], stype_in="instrument_id",
+                 start=s.isoformat(), end=e.isoformat()) for i, s, e in wins]
+    cost = sum(client.metadata.get_cost(**r) for r in reqs)
+    for i, s, e in wins:
+        print(f"  contract {i}: {s:%Y-%m-%d %H:%M} to {e:%Y-%m-%d %H:%M} ET")
+    print(f"Cost: ${cost:,.2f} for {len(reqs)} windows")
+    if not yes and input("Download? [y/N] ").strip().lower() not in ("y", "yes"):
+        raise SystemExit("Cancelled. Nothing was charged.")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t", "o", "h", "l", "c", "v", "instrument_id"])
+        for r in reqs:
+            df = client.timeseries.get_range(**r).to_df()
+            for ts, row in zip(df.index, df.itertuples(index=False)):
+                w.writerow([ts.isoformat(), row.open, row.high, row.low, row.close, int(row.volume), int(row.instrument_id)])
+                n += 1
+    print(f"Wrote {n} bars of incoming-contract data to {out}")
+    print(f"Use it with: python -m orbbot.research ... --level-csv {out}")
 
 
 def main() -> None:
@@ -75,9 +125,15 @@ def main() -> None:
     ap.add_argument("--out", default="data/mnq_databento.csv")
     ap.add_argument("--all-hours", action="store_true", help="keep all 23 hours in the CSV")
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation")
+    ap.add_argument("--roll-fill", metavar="FILE", help="download the incoming contract around each roll in "
+                    "this .dbn.zst, so prior-day/overnight levels on roll days use the right contract")
     ap.add_argument("--from-cache", metavar="FILE", help="rebuild the CSV from a .dbn.zst you already "
                     "downloaded (no API call, no charge)")
     a = ap.parse_args()
+
+    if a.roll_fill:
+        roll_fill(a.roll_fill, Path(a.out), a.yes)
+        return
 
     if a.from_cache:
         try:

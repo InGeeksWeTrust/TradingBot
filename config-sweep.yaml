@@ -41,6 +41,7 @@ risk:
   contracts: 10           # run with --contracts 20 (or change here) to size up
   max_contracts: 20
   min_contracts: 1
+  size_with_costs: true
   stop_mode: structural   # stop just beyond the sweep; contracts sized so risk stays $250
   fixed_stop_points: 12.5
   max_risk_per_trade: 250 # 10 MNQ -> 12.5 pt stop; 20 MNQ -> 6.25 pt stop

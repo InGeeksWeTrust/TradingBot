@@ -52,6 +52,12 @@ class TradePlan:
     risk_dollars: float
     reward_dollars: float
     note: str = ""
+    cost_dollars: float = 0.0   # estimated slippage (entry + stop) + round-trip fees for the size
+
+    @property
+    def worst_case_loss(self) -> float:
+        """Stop-out loss including estimated slippage and fees (what the budget has to cover)."""
+        return self.risk_dollars + self.cost_dollars
 
     def bracket_ticks(self) -> tuple[int, int]:
         """Signed bracket ticks as ProjectX expects: for a long the stop is negative and the
@@ -62,9 +68,19 @@ class TradePlan:
 
 
 def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: float,
-               contracts: int | None = None) -> TradePlan | None:
+               contracts: int | None = None, why: list | None = None) -> TradePlan | None:
     """Return a plan that respects per-trade risk, remaining daily-loss headroom and the
-    daily profit cap, or None if no acceptable trade fits."""
+    daily profit cap, or None if no acceptable trade fits (the reason is appended to `why`).
+
+    The stop is placed first (structural mode keeps the strategy's level and never moves it);
+    the contract count is then the largest that fits the budget. With size_with_costs the
+    budget also covers est_slippage_ticks on entry and stop plus round-trip fees, so a full
+    stop-out costs at most max_risk_per_trade. Size is never raised to reach a profit target."""
+    def skip(reason):
+        if why is not None:
+            why.append(reason)
+        return None
+
     tick, pv = spec.tick_size, spec.point_value
     n = min(contracts or cfg.contracts, cfg.max_contracts)
     notes = []
@@ -83,7 +99,7 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
         structural = cfg.fixed_stop_points
 
     if structural <= 0:
-        return None
+        return skip("bad_stop")
     if cfg.stop_mode == "structural":
         # keep the stop at the level; trade fewer contracts so the risk stays within budget
         stop_ticks = max(cfg.min_stop_ticks, math.ceil(structural / tick - 1e-9))
@@ -97,22 +113,25 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
         stop_ticks = max(cfg.min_stop_ticks, math.floor(stop / tick + 1e-9))
         stop = stop_ticks * tick
 
+    # costs per contract that a stop-out adds on top of the stop distance
+    cost_pc = 2 * cfg.est_slippage_ticks * spec.tick_value + cfg.fee_per_contract_rt
+    sizing_pc = stop * pv + (cost_pc if cfg.size_with_costs else 0.0)
     # remaining daily-loss headroom (realized is negative when losing)
     headroom = cfg.max_daily_loss + realized_pnl - cfg.loss_buffer
-    per_contract_risk = stop * pv + cfg.fee_per_contract_rt
-    by_trade = math.floor((cfg.max_risk_per_trade + 1e-9) / (stop * pv))
+    per_contract_risk = stop * pv + (cost_pc if cfg.size_with_costs else cfg.fee_per_contract_rt)
+    by_trade = math.floor((cfg.max_risk_per_trade + 1e-9) / sizing_pc)
     by_day = math.floor(headroom / per_contract_risk) if headroom > 0 else 0
     sized = min(n, by_trade, by_day)
     if sized < n:
         notes.append(f"size reduced {n}->{sized} (headroom ${headroom:.0f})")
     if sized < cfg.min_contracts:
-        return None
+        return skip("stop_too_wide" if by_trade < cfg.min_contracts else "daily_headroom")
 
     # target: R multiple, trimmed so a win doesn't overshoot the daily profit cap
     if cfg.target_mode == "level" and sig.target is not None:
         target = abs(sig.target - sig.price)    # strategy's own take-profit level
         if target <= 0:
-            return None
+            return skip("bad_target")
     elif cfg.target_usd > 0:
         target = cfg.target_usd / (sized * pv)  # fixed $ take-profit for the size actually traded
     else:
@@ -128,13 +147,13 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
     target = target_ticks * tick
     if cfg.target_usd > 0 or cfg.target_mode == "level":
         if cfg.min_reward_r > 0 and target < planned_target - tick / 2:
-            return None  # fixed-$ mode: the daily cap would cut the take-profit, so stop for the day
+            return skip("profit_cap")  # fixed-$ mode: the daily cap would cut the take-profit
     elif target < stop * cfg.min_reward_r - 1e-9:
-        return None  # what's left before the daily profit cap isn't worth the risk
+        return skip("profit_cap")  # what's left before the daily profit cap isn't worth the risk
 
     return TradePlan(sig.side, sized, sig.price, stop, target, stop_ticks, target_ticks,
                      risk_dollars=stop * pv * sized, reward_dollars=target * pv * sized,
-                     note="; ".join(notes))
+                     note="; ".join(notes), cost_dollars=cost_pc * sized)
 
 
 def trading_day_start(now: datetime) -> datetime:

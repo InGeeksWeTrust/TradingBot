@@ -150,6 +150,7 @@ _ALIASES = {
     "t": ["t", "time", "timestamp", "datetime", "date_time", "ts_event", "ts", "date"],
     "o": ["o", "open"], "h": ["h", "high"], "l": ["l", "low"], "c": ["c", "close", "last"],
     "v": ["v", "volume", "vol"],
+    "inst": ["instrument_id", "inst"],
 }
 
 
@@ -198,7 +199,8 @@ def load_csv(path: str, tz: str = "UTC") -> list[Bar]:
             raw_t = f"{row[date_col]} {row[time_col]}" if split_dt else row[col["t"]]
             out.append(Bar(_parse_time(raw_t, assume), float(row[col["o"]]), float(row[col["h"]]),
                            float(row[col["l"]]), float(row[col["c"]]),
-                           float(row[col["v"]] or 0) if col["v"] else 0.0))
+                           float(row[col["v"]] or 0) if col["v"] else 0.0,
+                           int(row[col["inst"]] or 0) if col["inst"] else 0))
     out.sort(key=lambda b: b.t)
     if not out:
         raise SystemExit(f"{path}: no rows")

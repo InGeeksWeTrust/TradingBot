@@ -219,9 +219,11 @@ class ORBBot:
         hist = self._bars(self.spec.contract_id, now - timedelta(days=self.cfg.history_days), now)
         feats = Features(hist, session.open, session.close)
         lv = feats.day_levels(day)
-        log.info("Sweep levels: prior-day high %s low %s | overnight high %s low %s",
-                 lv.pdh, lv.pdl, lv.onh, lv.onl)
-        strat = Sweep(self.cfg.strategy, self.spec.tick_size, feats, window="am", session=session)
+        log.info("Sweep levels: prior-day high %s low %s | overnight high %s low %s | entries until %s ET%s",
+                 lv.pdh, lv.pdl, lv.onh, lv.onl, self.cfg.strategy.entry_cutoff.strftime("%H:%M"),
+                 f" | plus intraday: {', '.join(self.cfg.sweep_extra)}" if self.cfg.sweep_extra else "")
+        strat = Sweep(self.cfg.strategy, self.spec.tick_size, feats, window="am", session=session,
+                      max_trades=self.cfg.strategy.max_trades_per_day, extra=self.cfg.sweep_extra)
         strat.reset(day)
         if self.confirm_spec:
             return Filtered(strat, [lambda sig: self.confirm is not None and self.confirm.check(sig.side, sig.time)])
@@ -364,7 +366,14 @@ class ORBBot:
                 return
 
             # --- new entries
+            cutoff_at = datetime.combine(day, s.entry_cutoff, ET)
             for sig in signals:
+                if sig.time > cutoff_at or now > cutoff_at + timedelta(minutes=2):
+                    # same rule as the strategies (signal bar must close by the cutoff), plus a hard
+                    # stop on placing entries more than 2 minutes after it
+                    log.info("Ignoring %s signal at %s ET: after entry cutoff %s ET", sig.side,
+                             sig.time.astimezone(ET).strftime("%H:%M"), s.entry_cutoff.strftime("%H:%M"))
+                    continue
                 if guard.halted or in_pos or pending:
                     log.info("Ignoring %s signal (halted=%s in_pos=%s pending=%s)", sig.side, guard.halted, in_pos, bool(pending))
                     continue

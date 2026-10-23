@@ -23,6 +23,7 @@ class Bar:
     l: float
     c: float
     v: float = 0.0
+    inst: int = 0  # exchange instrument id of the contract this bar is from (0 = unknown / single contract)
 
     @classmethod
     def from_api(cls, d: dict) -> "Bar":
