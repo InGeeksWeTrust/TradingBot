@@ -665,3 +665,58 @@ def test_31_audit_missing_paper_file_passes_a_quiet_day_and_fails_with_intents(t
     (tmp_path / "state" / "paper_broker.json").unlink()   # intents but no paper file -> FAIL
     overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
     assert overall == "FAIL" and "| 1 cross-store | FAIL | no paper account file but 1 entry intent(s) today |" in text
+
+
+def test_32_audit_scheduled_flatten_is_routine_other_flattens_are_reviewed(tmp_path):
+    from orbbot.audit import audit
+    market, paper, clock = _paper_scenario(tmp_path)
+    market.price_fn = _two_sweeps
+    sc = Scenario(tmp_path, broker=paper, clock=clock)
+    sc.run_until(9, 45, 30)
+    market.price_fn = lambda t: (20050, 20052, 20048, 20050)   # flat: neither stop nor target is reached
+    sc.run_until(11, 56, step=30)                   # the short is still open at the flatten time
+    sc.close()
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "PASS", text
+    assert "events to review none" in text and "info: routine 'session flatten time' flatten x1" in text
+    store = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: datetime.combine(DAY, time(12, 0), ET))
+    store.event("flatten_start", "kill switch file 'STOP' present")
+    store.close()
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "WARN" and "events to review {'flatten_start': 1}" in text
+
+
+def test_33_audit_fails_on_more_than_one_session_start(tmp_path):
+    from orbbot.audit import audit
+    market, paper, clock = _paper_scenario(tmp_path)
+    market.price_fn = _two_sweeps
+    sc = Scenario(tmp_path, broker=paper, clock=clock)
+    sc.run_until(9, 45, 30)
+    base = market.price_fn                          # the short reaches its target at 9:48
+    market.price_fn = lambda t: (19900, 19905, 19895, 19900) if time(9, 48) <= t.astimezone(ET).time() < time(9, 50) else base(t)
+    sc.run_until(11, 56, step=30)
+    sc.close()
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "PASS" and "| 5 events | PASS | 1 session start(s) today |" in text, text
+    store = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: datetime.combine(DAY, time(9, 31), ET))
+    store.event("session_start", "pid 2; a second instance")
+    store.close()
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "FAIL" and "2 session starts today" in text
+
+
+def test_34_single_instance_lock(tmp_path, caplog):
+    from orbbot.bot import acquire_instance_lock, ensure_single_instance
+    path = tmp_path / "state" / "bot.lock"
+    path.parent.mkdir()
+    path.write_text("left behind by a crash")       # a stale file does not block
+    first = ensure_single_instance(tmp_path / "state")
+    assert acquire_instance_lock(path) is None      # a second holder is refused
+    with pytest.raises(SystemExit) as e:
+        ensure_single_instance(tmp_path / "state")
+    assert e.value.code == 2
+    assert any(r.levelname == "CRITICAL" and "Another bot instance" in r.message for r in caplog.records)
+    first.close()                                   # holder exits -> lock is free again
+    again = acquire_instance_lock(path)
+    assert again is not None
+    again.close()

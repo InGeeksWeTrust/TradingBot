@@ -74,6 +74,15 @@ def test_daily_headroom_limits_size_and_reports_reason():
     assert p is None and why == ["daily_headroom"]
 
 
+def test_size_reduction_note_names_the_binding_limit():
+    p, _ = plan(short(22.0), WITH_COSTS)                    # $46.22/ct: cap allows 5, headroom $475 allows 10
+    assert p.contracts == 5 and p.note == "size reduced 10->5 (bound by trade risk cap $250)"
+    p, _ = plan(short(10.0), WITH_COSTS, realized=-400.0)   # $22.22/ct: cap allows 11, headroom $75 allows 3
+    assert p.contracts == 3 and p.note == "size reduced 10->3 (bound by daily headroom $75)"
+    p = plan_trade(short(2.0), WITH_COSTS, MNQ, 0.0, 15)    # asked for 15, max_contracts is 10
+    assert p.contracts == 10 and p.note == "size reduced 15->10 (bound by max_contracts 10)"
+
+
 def test_target_is_2r_of_the_kept_stop_never_resized_for_profit():
     p, _ = plan(short(25.0), WITH_COSTS)
     assert p.target_points == 50.0 and p.contracts == 4

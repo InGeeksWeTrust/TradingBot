@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 import time
@@ -272,7 +273,8 @@ class Session:
         self._catch_up_eod()
         if b.confirm_spec:
             self.engine.confirm_contract = b.confirm_spec.contract_id
-            self.store.event("session_start", f"confirmation contract {b.confirm_spec.contract_id}")
+        self.store.event("session_start", f"pid {os.getpid()}"
+                         + (f"; confirmation contract {b.confirm_spec.contract_id}" if b.confirm_spec else ""))
         action = self.engine.recover(self.day, self.fresh, self.expected_stop)
         if action == "flatten":
             self.do_flatten("start-up: open position without verified protection")
@@ -672,6 +674,38 @@ def setup_logging(log_dir: str) -> None:
     root.handlers[:] = [sh, fh]
 
 
+def acquire_instance_lock(path: str | Path):
+    """Take an exclusive OS lock on `path`. Returns the open file (keep it for the life of the process)
+    or None if another process holds it. The OS drops the lock when its holder exits, so a file left
+    behind by a crash or reboot never blocks a start."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def ensure_single_instance(state_dir: str | Path):
+    """Exit with a CRITICAL log line if another bot already runs against `state_dir`."""
+    path = Path(state_dir) / "bot.lock"
+    lock = acquire_instance_lock(path)
+    if lock is None:
+        log.critical("Another bot instance holds %s; exiting so that only one instance trades", path)
+        raise SystemExit(2)
+    log.info("Instance lock %s acquired (pid %s)", path, os.getpid())
+    return lock
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="TopstepX futures bot (ORB or sweep entries)")
     ap.add_argument("--config", default="config.yaml")
@@ -687,6 +721,7 @@ def main() -> None:
     cfg = load_config(a.config)
     setup_logging(cfg.log_dir)
     mode = "paper" if a.dry_run else "readonly" if a.read_only else "live"
+    lock = None if mode == "readonly" else ensure_single_instance(cfg.safety.state_dir)  # noqa: F841 (held until exit)
     bot = ORBBot(cfg, mode=mode, contracts=a.contracts)
     if mode == "readonly":
         raise SystemExit(bot.read_only())

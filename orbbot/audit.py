@@ -17,7 +17,8 @@ Checks
   4 Account guard: the Maximum Loss Limit floor, whether it rests on an approximate end-of-day
     balance, and the room above the buffer.
   5 Operational events: CRITICAL log lines, failed flattens, crashes, protection failures,
-    unexpected positions, state recovery, stale-data blocks.
+    unexpected positions, state recovery, stale-data blocks, more than one session start a day.
+    The scheduled "session flatten time" flatten is routine; any other flatten is to review.
   6 Frozen configuration: a fingerprint of every strategy/risk/confirmation/forward-test setting is
     stored on the first audit; any later difference is a FAIL.
 """
@@ -37,6 +38,7 @@ from .state import StateStore
 from .strategy import ET
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+ROUTINE_FLATTEN = "session flatten time"     # the reason bot.py gives the scheduled flatten
 
 
 def frozen_fingerprint(cfg: BotConfig) -> tuple[str, dict]:
@@ -188,9 +190,14 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
     for _, kind, _d in events:
         kinds[kind] = kinds.get(kind, 0) + 1
     hard = {k: kinds[k] for k in ("flatten_failed", "session_crash", "state_recovered") if k in kinds}
-    soft = {k: kinds[k] for k in ("protection_failed", "flatten_start", "unexpected_unprotected",
+    soft = {k: kinds[k] for k in ("protection_failed", "unexpected_unprotected",
                                   "unexpected_protected", "reconcile_absent", "reconcile_position_without_order",
                                   "restart_unprotected", "mll_floor_approximate") if k in kinds}
+    # the scheduled end-of-session flatten is routine; any other flatten reason is reviewed
+    flattens = [e[2] for e in events if e[1] == "flatten_start"]
+    routine = sum(1 for why in flattens if why == ROUTINE_FLATTEN)
+    if len(flattens) > routine:
+        soft["flatten_start"] = len(flattens) - routine
     stale = sum(1 for e in events if e[1] == "signal_blocked" and "stale" in e[2])
     log = root / cfg.log_dir / f"orbbot-{day:%Y%m%d}.log"
     crit = errs = 0
@@ -202,7 +209,12 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
         f"hard events {hard or 'none'}; CRITICAL log lines {crit}; ERROR lines {errs}")
     restarts = sum(1 for e in events if e[1] == "reconciled")
     add("5 events", WARN if soft else PASS,
-        f"events to review {soft or 'none'}; start-up reconciliations {restarts}; stale-data blocks {stale}")
+        f"events to review {soft or 'none'}; start-up reconciliations {restarts}; stale-data blocks {stale}"
+        + (f"; info: routine '{ROUTINE_FLATTEN}' flatten x{routine}" if routine else ""))
+    starts = kinds.get("session_start", 0)
+    add("5 events", FAIL if starts > 1 else PASS,
+        f"{starts} session starts today (two bot instances, or a restart mid-session)" if starts > 1 else
+        f"{starts} session start(s) today")
 
     # 6. frozen configuration
     fp, keep = frozen_fingerprint(cfg)

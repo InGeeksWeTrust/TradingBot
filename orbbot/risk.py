@@ -82,7 +82,8 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
         return None
 
     tick, pv = spec.tick_size, spec.point_value
-    n = min(contracts or cfg.contracts, cfg.max_contracts)
+    wanted = contracts or cfg.contracts
+    n = min(wanted, cfg.max_contracts)
     notes = []
 
     # structural stop distance
@@ -122,8 +123,12 @@ def plan_trade(sig: Signal, cfg: RiskConfig, spec: ContractSpec, realized_pnl: f
     by_trade = math.floor((cfg.max_risk_per_trade + 1e-9) / sizing_pc)
     by_day = math.floor(headroom / per_contract_risk) if headroom > 0 else 0
     sized = min(n, by_trade, by_day)
-    if sized < n:
-        notes.append(f"size reduced {n}->{sized} (headroom ${headroom:.0f})")
+    if sized < wanted:
+        # name the limit(s) that set the size, not just the daily headroom
+        bound = [label for label, cap in ((f"max_contracts {cfg.max_contracts}", cfg.max_contracts),
+                                          (f"trade risk cap ${cfg.max_risk_per_trade:.0f}", by_trade),
+                                          (f"daily headroom ${headroom:.0f}", by_day)) if cap == sized]
+        notes.append(f"size reduced {wanted}->{sized} (bound by {' and '.join(bound)})")
     if sized < cfg.min_contracts:
         return skip("stop_too_wide" if by_trade < cfg.min_contracts else "daily_headroom")
 
