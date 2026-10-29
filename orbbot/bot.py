@@ -26,6 +26,7 @@ import argparse
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -50,6 +51,20 @@ MONTHS = "FGHJKMNQUVXZ"
 
 def now_et() -> datetime:
     return datetime.now(ET)
+
+
+def code_version(root: str | Path | None = None) -> str:
+    """Short commit hash of the code that is running, with " (dirty)" when orbbot/*.py or a config
+    file has uncommitted changes. The forward-test record (state/, journal/, logs/) does not count."""
+    root = Path(root) if root else Path(__file__).resolve().parent.parent
+    try:
+        git = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True,  # noqa: E731
+                                        timeout=10, check=True).stdout.strip()
+        head = git("rev-parse", "--short=7", "HEAD")
+        dirty = git("status", "--porcelain", "--", "orbbot/*.py", "config*.yaml")
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return head + (" (dirty)" if dirty else "")
 
 
 class ORBBot:
@@ -85,6 +100,7 @@ class ORBBot:
         self.spec: ContractSpec | None = None
         self.confirm_spec: ContractSpec | None = None
         self.done_day = None
+        self.code_version = "unknown"     # set by main() from git
 
     # ------------------------------------------------------------------ setup
     def connect(self) -> None:
@@ -222,6 +238,7 @@ class Session:
         self.ready_at = datetime.combine(day, self.session.open, ET) + timedelta(minutes=1)
         self.stale_since: datetime | None = None
         self.mfe = self.mae = 0.0
+        self.last_beat: datetime | None = None
 
     # ------------------------------------------------------------------ helpers
     def utc(self) -> datetime:
@@ -240,6 +257,17 @@ class Session:
             return None
         sign = 1 if intent["side"] == "long" else -1
         return float(pos["averagePrice"]) - sign * float(plan["stop_pts"])
+
+    def beat(self) -> None:
+        """At most once a minute, record that this process is alive in today's session. The audit uses
+        it to tell a restart (the old process had stopped) from two processes running at once."""
+        now = self.utc()
+        if self.last_beat is None or (now - self.last_beat).total_seconds() >= 60:
+            self.last_beat = now
+            try:
+                self.store.put(f"alive:{self.day}:{os.getpid()}", now.isoformat())
+            except StateError:
+                pass
 
     def halt(self, reason: str) -> None:
         if not self.halted:
@@ -273,8 +301,9 @@ class Session:
         self._catch_up_eod()
         if b.confirm_spec:
             self.engine.confirm_contract = b.confirm_spec.contract_id
-        self.store.event("session_start", f"pid {os.getpid()}"
+        self.store.event("session_start", f"pid {os.getpid()}; code {b.code_version}"
                          + (f"; confirmation contract {b.confirm_spec.contract_id}" if b.confirm_spec else ""))
+        self.beat()
         action = self.engine.recover(self.day, self.fresh, self.expected_stop)
         if action == "flatten":
             self.do_flatten("start-up: open position without verified protection")
@@ -440,6 +469,7 @@ class Session:
     def poll(self) -> str:
         cfg, s, eng = self.cfg, self.s, self.engine
         now = self.now()
+        self.beat()
 
         # 1. kill switches
         if Path(cfg.kill_switch_file).exists():
@@ -700,7 +730,8 @@ def ensure_single_instance(state_dir: str | Path):
     path = Path(state_dir) / "bot.lock"
     lock = acquire_instance_lock(path)
     if lock is None:
-        log.critical("Another bot instance holds %s; exiting so that only one instance trades", path)
+        log.critical("duplicate start rejected (pid %s): another bot instance holds %s; exiting so that only "
+                     "one instance trades", os.getpid(), path)
         raise SystemExit(2)
     log.info("Instance lock %s acquired (pid %s)", path, os.getpid())
     return lock
@@ -722,7 +753,11 @@ def main() -> None:
     setup_logging(cfg.log_dir)
     mode = "paper" if a.dry_run else "readonly" if a.read_only else "live"
     lock = None if mode == "readonly" else ensure_single_instance(cfg.safety.state_dir)  # noqa: F841 (held until exit)
+    from .audit import frozen_fingerprint
+    version = code_version()
+    log.info("Code version %s | frozen config fingerprint %s", version, frozen_fingerprint(cfg)[0])
     bot = ORBBot(cfg, mode=mode, contracts=a.contracts)
+    bot.code_version = version
     if mode == "readonly":
         raise SystemExit(bot.read_only())
     try:

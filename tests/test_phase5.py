@@ -686,23 +686,125 @@ def test_32_audit_scheduled_flatten_is_routine_other_flattens_are_reviewed(tmp_p
     assert overall == "WARN" and "events to review {'flatten_start': 1}" in text
 
 
-def test_33_audit_fails_on_more_than_one_session_start(tmp_path):
-    from orbbot.audit import audit
+def _clean_day(tmp_path):
+    """A paper session whose short reaches its target at 9:48; the bot then idles to the flatten time."""
     market, paper, clock = _paper_scenario(tmp_path)
     market.price_fn = _two_sweeps
     sc = Scenario(tmp_path, broker=paper, clock=clock)
     sc.run_until(9, 45, 30)
-    base = market.price_fn                          # the short reaches its target at 9:48
+    base = market.price_fn
     market.price_fn = lambda t: (19900, 19905, 19895, 19900) if time(9, 48) <= t.astimezone(ET).time() < time(9, 50) else base(t)
     sc.run_until(11, 56, step=30)
     sc.close()
-    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
-    assert overall == "PASS" and "| 5 events | PASS | 1 session start(s) today |" in text, text
-    store = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: datetime.combine(DAY, time(9, 31), ET))
-    store.event("session_start", "pid 2; a second instance")
+    return sc
+
+
+def _add_start(tmp_path, at: time, pid: int):
+    store = StateStore(tmp_path / "state" / "paper.sqlite", clock=lambda: datetime.combine(DAY, at, ET))
+    store.event("session_start", f"pid {pid}; code abc1234")
     store.close()
+
+
+def test_33_audit_restart_is_a_warning_overlapping_processes_fail(tmp_path):
+    import os
+    from orbbot.audit import audit
+    sc = _clean_day(tmp_path)
     overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
-    assert overall == "FAIL" and "2 session starts today" in text
+    assert overall == "PASS", text
+    assert f"| 5 events | PASS | 1 session start(s) today: pid {os.getpid()} code unknown |" in text
+    _add_start(tmp_path, time(12, 30), 999)         # first process's last heartbeat is ~11:55 -> a restart
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "WARN" and "restart during session: pid 999 started at 12:30:00 ET (review)" in text
+    _add_start(tmp_path, time(10, 0), 998)          # the first process was still beating after 10:00
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "FAIL" and f"two session starts overlapped: pid 998 started at 10:00:00 ET while pid {os.getpid()} still running" in text
+
+
+def test_35_audit_duplicate_start_rejected_by_the_lock_is_a_warning(tmp_path):
+    from orbbot.audit import audit
+    sc = _clean_day(tmp_path)
+    log = tmp_path / "logs" / "orbbot-20261022.log"     # a bot started the evening before writes here
+    log.parent.mkdir(exist_ok=True)
+    log.write_text("2026-10-22 21:00:00,000 INFO     Idle\n"
+                   "2026-10-23 06:40:00,000 CRITICAL duplicate start rejected (pid 4242): another bot instance "
+                   "holds state/bot.lock; exiting so that only one instance trades\n", encoding="utf-8")
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "WARN", text
+    assert "| 5 events | WARN | duplicate start rejected (pid 4242) |" in text and "CRITICAL log lines 0" in text
+    with log.open("a", encoding="utf-8") as f:          # any other CRITICAL line still fails the day
+        f.write("2026-10-23 07:00:00,000 CRITICAL State database write/read failed\n")
+    overall, text = audit(sc.cfg, DAY, "paper", root=tmp_path)
+    assert overall == "FAIL" and "CRITICAL log lines 1" in text
+
+
+def test_36_code_version_reports_commit_and_dirty_code(tmp_path):
+    import subprocess
+    from orbbot.bot import code_version
+    assert code_version(tmp_path) == "unknown"          # not a git repository
+    git = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True)  # noqa: E731
+    git("init", "-q")
+    (tmp_path / "orbbot").mkdir()
+    (tmp_path / "orbbot" / "x.py").write_text("A = 1\n")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "s.txt").write_text("0")
+    git("add", "."), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    head = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "--short=7", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    assert code_version(tmp_path) == head
+    (tmp_path / "state" / "s.txt").write_text("1")      # the forward-test record changing is not "dirty"
+    assert code_version(tmp_path) == head
+    (tmp_path / "orbbot" / "x.py").write_text("A = 2\n")
+    assert code_version(tmp_path) == f"{head} (dirty)"
+
+
+def test_37_dst_fall_back_monday_session_times(tmp_path, monkeypatch):
+    """Clocks fall back on Sun 2026-11-01. Monday Nov 2 still runs 09:30-11:55 ET, now 07:30-09:55 AZ
+    (07:25 AZ start-up), cutoff 11:00 ET (09:00 AZ), and the end-of-day balance is taken after 15:10 CT."""
+    from datetime import date
+    from zoneinfo import ZoneInfo
+    from orbbot.bot import ORBBot, Session
+    from orbbot.config import AccountConfig
+    az, ct = ZoneInfo("America/Phoenix"), ZoneInfo("America/Chicago")
+    utc = FakeClock(datetime(2026, 10, 31, 23, 0, tzinfo=timezone.utc))   # Sat evening, still EDT
+    clock = lambda: utc().astimezone(ET)                                   # noqa: E731
+    stop_at = datetime(2026, 11, 2, 23, 0, tzinfo=timezone.utc)           # Mon 18:00 ET
+
+    class Done(Exception):
+        pass
+
+    def sleep(s):
+        utc.advance(s)
+        if utc() >= stop_at:
+            raise Done
+
+    cfg = make_cfg(tmp_path)
+    cfg.account = AccountConfig(max_loss_limit=4500, start_balance=50_000)
+    bot = ORBBot(cfg, mode="paper", api=FakeBroker(utc), clock=clock, sleep=sleep)
+    runs = []
+
+    def run_session(day):
+        runs.append((day, clock(), Session(bot, day)))
+        utc.t = datetime.combine(day, time(11, 58), ET).astimezone(timezone.utc)
+    monkeypatch.setattr(bot, "run_session", run_session)
+    with pytest.raises(Done):
+        bot.run_forever()
+
+    monday = date(2026, 11, 2)
+    assert [r[0] for r in runs] == [monday]                       # nothing on Saturday or Sunday
+    _, started, sess = runs[0]
+    assert started.astimezone(az).strftime("%H:%M") == "07:25"    # 09:25 ET prep, five minutes before the open
+    assert started.utcoffset() == timedelta(hours=-5)             # EST
+    opened = datetime.combine(monday, sess.session.open, ET)
+    assert (opened.strftime("%H:%M"), opened.astimezone(az).strftime("%H:%M")) == ("09:30", "07:30")
+    assert (sess.cutoff_at.strftime("%H:%M"), sess.cutoff_at.astimezone(az).strftime("%H:%M")) == ("11:00", "09:00")
+    assert (sess.flatten_at.strftime("%H:%M"), sess.flatten_at.astimezone(az).strftime("%H:%M")) == ("11:55", "09:55")
+    assert sess.flatten_at.astimezone(timezone.utc).strftime("%H:%M") == "16:55"
+    eods = bot.store.events("eod_balance")
+    assert eods and all(e[2].startswith("2026-11-02") for e in eods)
+    first = datetime.fromisoformat(eods[0][0])
+    assert first.astimezone(ct).date() == monday and time(15, 10) <= first.astimezone(ct).time() < time(17, 0)
+    assert first.astimezone(az).strftime("%H:%M") >= "14:10"     # 15:10 CST = 14:10 AZ
+    bot.store.close()
 
 
 def test_34_single_instance_lock(tmp_path, caplog):
@@ -715,7 +817,7 @@ def test_34_single_instance_lock(tmp_path, caplog):
     with pytest.raises(SystemExit) as e:
         ensure_single_instance(tmp_path / "state")
     assert e.value.code == 2
-    assert any(r.levelname == "CRITICAL" and "Another bot instance" in r.message for r in caplog.records)
+    assert any(r.levelname == "CRITICAL" and "duplicate start rejected" in r.message for r in caplog.records)
     first.close()                                   # holder exits -> lock is free again
     again = acquire_instance_lock(path)
     assert again is not None

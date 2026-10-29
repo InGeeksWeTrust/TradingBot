@@ -17,8 +17,11 @@ Checks
   4 Account guard: the Maximum Loss Limit floor, whether it rests on an approximate end-of-day
     balance, and the room above the buffer.
   5 Operational events: CRITICAL log lines, failed flattens, crashes, protection failures,
-    unexpected positions, state recovery, stale-data blocks, more than one session start a day.
-    The scheduled "session flatten time" flatten is routine; any other flatten is to review.
+    unexpected positions, state recovery, stale-data blocks. The scheduled "session flatten time"
+    flatten is routine; any other flatten is to review. Session starts show the pid and code
+    version; a second start is a WARN restart, or a FAIL if the earlier process was still alive
+    (its once-a-minute heartbeat is later than the second start). A start refused by the
+    single-instance lock is a WARN, not a CRITICAL.
   6 Frozen configuration: a fingerprint of every strategy/risk/confirmation/forward-test setting is
     stored on the first audit; any later difference is a FAIL.
 """
@@ -28,6 +31,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 from dataclasses import asdict
 from datetime import date, datetime, time
 from pathlib import Path
@@ -39,6 +43,7 @@ from .strategy import ET
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 ROUTINE_FLATTEN = "session flatten time"     # the reason bot.py gives the scheduled flatten
+DUPLICATE_START = "duplicate start rejected"  # bot.py's log line when the instance lock is held
 
 
 def frozen_fingerprint(cfg: BotConfig) -> tuple[str, dict]:
@@ -53,6 +58,21 @@ def frozen_fingerprint(cfg: BotConfig) -> tuple[str, dict]:
 
 def _et_date(iso: str) -> date:
     return datetime.fromisoformat(iso).astimezone(ET).date()
+
+
+def _et(iso: str) -> str:
+    return datetime.fromisoformat(iso).astimezone(ET).strftime("%H:%M:%S ET")
+
+
+def _log_lines(log_dir: Path, day: date):
+    """Lines stamped `day` from every bot log. A log file is named after the day its bot started,
+    so a bot left running overnight writes the session into the previous day's file."""
+    for f in sorted(log_dir.glob("orbbot-*.log")):
+        if date.fromtimestamp(f.stat().st_mtime) < day:
+            continue
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith(day.isoformat()):
+                yield line
 
 
 def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")) -> tuple[str, str]:
@@ -199,22 +219,40 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
     if len(flattens) > routine:
         soft["flatten_start"] = len(flattens) - routine
     stale = sum(1 for e in events if e[1] == "signal_blocked" and "stale" in e[2])
-    log = root / cfg.log_dir / f"orbbot-{day:%Y%m%d}.log"
     crit = errs = 0
-    if log.exists():
-        for line in log.read_text(errors="replace").splitlines():
-            crit += " CRITICAL " in line
-            errs += " ERROR " in line or "Traceback" in line
+    rejected = []                           # pids of starts refused by the single-instance lock
+    for line in _log_lines(root / cfg.log_dir, day):
+        if DUPLICATE_START in line:
+            m = re.search(r"\(pid (\d+)\)", line)
+            rejected.append(m.group(1) if m else "?")
+            continue
+        crit += " CRITICAL " in line
+        errs += " ERROR " in line or "Traceback" in line
     add("5 events", FAIL if (hard or crit) else PASS,
         f"hard events {hard or 'none'}; CRITICAL log lines {crit}; ERROR lines {errs}")
+    for pid in rejected:
+        add("5 events", WARN, f"duplicate start rejected (pid {pid})")
     restarts = sum(1 for e in events if e[1] == "reconciled")
     add("5 events", WARN if soft else PASS,
         f"events to review {soft or 'none'}; start-up reconciliations {restarts}; stale-data blocks {stale}"
         + (f"; info: routine '{ROUTINE_FLATTEN}' flatten x{routine}" if routine else ""))
-    starts = kinds.get("session_start", 0)
-    add("5 events", FAIL if starts > 1 else PASS,
-        f"{starts} session starts today (two bot instances, or a restart mid-session)" if starts > 1 else
-        f"{starts} session start(s) today")
+    starts = [(at, re.search(r"pid (\d+)", d), re.search(r"code ([0-9a-f]+(?: \(dirty\))?|unknown)", d))
+              for at, kind, d in sorted(events, key=lambda e: datetime.fromisoformat(e[0])) if kind == "session_start"]
+    ran = ", ".join(f"pid {p.group(1) if p else '?'} code {c.group(1) if c else '?'}" for _, p, c in starts)
+    add("5 events", PASS, f"{len(starts)} session start(s) today" + (f": {ran}" if starts else ""))
+    for n, (at, pid, _) in enumerate(starts[1:], 1):
+        t = _et(at)
+        if pid is None or any(p is None for _, p, _ in starts[:n]):
+            add("5 events", WARN, f"restart during session at {t} (no pid recorded: cannot check for overlap)")
+            continue
+        overlap = []
+        for _, p, _ in starts[:n]:
+            alive = store.get(f"alive:{day}:{p.group(1)}")
+            if p.group(1) != pid.group(1) and alive and datetime.fromisoformat(alive) >= datetime.fromisoformat(at):
+                overlap.append(f"pid {p.group(1)} still running at {_et(alive)}")
+        add("5 events", FAIL if overlap else WARN,
+            f"two session starts overlapped: pid {pid.group(1)} started at {t} while {'; '.join(overlap)}"
+            if overlap else f"restart during session: pid {pid.group(1)} started at {t} (review)")
 
     # 6. frozen configuration
     fp, keep = frozen_fingerprint(cfg)
