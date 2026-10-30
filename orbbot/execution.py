@@ -75,6 +75,39 @@ class TransitionError(RuntimeError):
     pass
 
 
+# ---------------------------------------------------------------------- bracket mode (Auto OCO)
+AUTO_OCO_OFF = ("Auto OCO Brackets is OFF for this account (it uses Position Brackets), so Order/place with "
+                "brackets is rejected. Turn on Auto OCO Brackets in the TopstepX platform settings")
+
+
+def explain_rejection(text: str) -> str:
+    """A clearer message for broker rejections we know; anything else is returned unchanged."""
+    t = text.lower()
+    if ("auto oco" in t or "position brackets" in t) and not text.startswith(AUTO_OCO_OFF):
+        return f"{AUTO_OCO_OFF} (broker: {text})"
+    return text
+
+
+def auto_oco_status(account: dict) -> bool | None:
+    """The account's Auto OCO Brackets setting if the API reports it (it doesn't as of Oct 2026:
+    Account/search returns id, name, balance, canTrade, isVisible, simulated), else None."""
+    for k, v in account.items():
+        if "oco" in str(k).lower():
+            return bool(v)
+    return None
+
+
+def bracket_preflight(account: dict, confirmed: bool) -> str | None:
+    """None if bracket orders can be sent; otherwise why not. Used at start-up by `bot --live` and the drill."""
+    status = auto_oco_status(account)
+    if status is False:
+        return f"the broker reports Auto OCO Brackets OFF for {account.get('name')}: {AUTO_OCO_OFF}"
+    if status is None and not confirmed:
+        return (f"the API can't report whether Auto OCO Brackets is on for {account.get('name')}. Check it in "
+                f"TopstepX ({AUTO_OCO_OFF.split('. ')[1]}), then set safety.auto_oco_confirmed: true")
+    return None
+
+
 def _ts(x) -> datetime | None:
     if not x:
         return None
@@ -332,7 +365,11 @@ class ExecutionEngine:
                 self.transition(intent, S.UNKNOWN, str(e))
                 self.block("unknown_order", f"order {intent['tag']} outcome unknown ({e.code}); reconciling")
             else:
-                self.transition(intent, S.REJECTED, str(e))
+                why = explain_rejection(str(e))
+                self.transition(intent, S.REJECTED, why)
+                if why != str(e):
+                    log.critical("Order %s rejected: %s", intent["tag"], why)
+                    self.store.event("bracket_mode_rejected", f"{intent['tag']}: {why}")
                 self.active = None
             return
         except Exception as e:  # noqa: BLE001 - anything else: we can't know

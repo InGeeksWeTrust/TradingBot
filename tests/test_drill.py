@@ -19,7 +19,8 @@ class PracBroker(FakeBroker):
         return [dict(a) for a in self.accounts]
 
 
-def _drill(tmp_path, at=time(13, 0), on_sleep=None, typed=ALLOWED_ACCOUNT_NAME, broker_cls=PracBroker, **faults):
+def _drill(tmp_path, at=time(13, 0), on_sleep=None, typed=ALLOWED_ACCOUNT_NAME, broker_cls=PracBroker, oco=True,
+           **faults):
     clock = FakeClock(datetime.combine(DAY, at, ET))
     broker = broker_cls(clock)
     for k, v in faults.items():
@@ -32,6 +33,7 @@ def _drill(tmp_path, at=time(13, 0), on_sleep=None, typed=ALLOWED_ACCOUNT_NAME, 
         if on_sleep:
             on_sleep(broker, len(sleeps))
     cfg = make_cfg(tmp_path)
+    cfg.safety.auto_oco_confirmed = oco
     d = Drill(cfg, api=broker, clock=clock, sleep=sleep, ask=lambda prompt: typed, root=tmp_path, out=out.append)
     return d, broker, cfg, out
 
@@ -235,9 +237,118 @@ def test_drill_last_price_is_the_newest_bar_even_when_bars_come_newest_first(tmp
 
 def test_drill_refuses_when_the_newest_bar_is_stale(tmp_path):
     d, broker, cfg, out = _drill(tmp_path, bars_stop_at=datetime.combine(DAY, time(12, 55), ET))
-    with pytest.raises(Refused, match="newest MNQ bar is 300s old"):
+    with pytest.raises(Refused, match="newest MNQ bar started 300s earlier"):
         d.run()
     assert broker.place_calls == []
+
+
+# ---------------------------------------------------------------- Auto OCO Brackets preflight
+OCO_TEXT = "Brackets cannot be used with Position Brackets. You must enable Auto OCO Brackets."
+
+
+class PositionBrackets(PracBroker):
+    def place_order(self, *a, **kw):
+        from orbbot.api import ApiError
+        self.place_calls.append({"tag": kw.get("custom_tag")})
+        raise ApiError("Order/place", 2, OCO_TEXT)
+
+
+def test_drill_refuses_until_auto_oco_is_confirmed(tmp_path):
+    d, broker, cfg, out = _drill(tmp_path, oco=False)
+    with pytest.raises(Refused, match="safety.auto_oco_confirmed: true"):
+        d.run()
+    assert broker.place_calls == []
+
+
+def test_drill_refuses_if_the_api_reports_auto_oco_off(tmp_path):
+    class Off(PracBroker):
+        accounts = [dict(PRAC, autoOcoBrackets=False)]       # in case ProjectX ever reports it
+    d, broker, cfg, out = _drill(tmp_path, broker_cls=Off)  # config says confirmed: the broker wins
+    with pytest.raises(Refused, match="reports Auto OCO Brackets OFF"):
+        d.run()
+    assert broker.place_calls == []
+
+
+def test_position_brackets_rejection_is_explained_and_audited_as_a_warning(tmp_path):
+    from orbbot.audit import drill_section
+    d, broker, cfg, out = _drill(tmp_path, broker_cls=PositionBrackets)
+    assert d.run() == 0                                       # rejected, nothing open, account flat
+    it, states, fwd, events = _states(tmp_path)
+    assert states == ["CREATED", "SUBMITTING", "REJECTED"] and len(broker.place_calls) == 1
+    assert any(e[1] == "bracket_mode_rejected" and "Turn on Auto OCO Brackets" in e[2] for e in events)
+    assert "Turn on Auto OCO Brackets in the TopstepX platform settings" in "\n".join(out)
+    text = "\n".join(drill_section(cfg, DAY, tmp_path)[0])
+    assert "**Drill: WARN**" in text and "| WARN | " in text and "rejected: Auto OCO Brackets is OFF" in text
+    assert text.count("Auto OCO Brackets is OFF") == 1      # explained once, not wrapped twice
+
+
+def test_drill_audit_rejected_plus_filled_is_warn_and_not_flat_is_fail(tmp_path):
+    from orbbot.audit import drill_section
+    d, broker, cfg, out = _drill(tmp_path, broker_cls=PositionBrackets)
+    d.run()
+    d2, broker2, _, _ = _drill(tmp_path, at=time(13, 5), on_sleep=_hit_target_once)
+    assert d2.run() == 0
+    text = "\n".join(drill_section(cfg, DAY, tmp_path)[0])
+    assert "**Drill: WARN**" in text and "| FAIL |" not in text
+    s = StateStore(tmp_path / "state-drill" / "drill.sqlite", clock=lambda: datetime.combine(DAY, time(13, 6), ET))
+    s.db.execute("UPDATE events SET detail = 'NOT FLAT: positions [(\"C\", 1)]' WHERE id = "
+                 "(SELECT max(id) FROM events WHERE kind = 'drill_end')")
+    s.close()
+    text = "\n".join(drill_section(cfg, DAY, tmp_path)[0])
+    assert "**Drill: FAIL**" in text and "account at the end: NOT FLAT" in text
+
+
+def test_bot_live_refuses_until_auto_oco_is_confirmed(tmp_path, caplog):
+    import logging
+    from orbbot.bot import ORBBot
+    clock = FakeClock(datetime.combine(DAY, time(8, 0), ET))
+    cfg = make_cfg(tmp_path, live_trading_enabled=True)
+    bot = ORBBot(cfg, mode="live", api=FakeBroker(clock), clock=clock, sleep=clock.advance)
+    with caplog.at_level(logging.WARNING), pytest.raises(SystemExit, match="auto_oco_confirmed"):
+        bot.connect()
+    assert any(r.levelname == "CRITICAL" and "Live trading refused" in r.message for r in caplog.records)
+    bot.store.close()
+    cfg.safety.auto_oco_confirmed = True
+    caplog.clear()
+    bot = ORBBot(cfg, mode="live", api=FakeBroker(clock), clock=clock, sleep=clock.advance)
+    with caplog.at_level(logging.WARNING):
+        bot.connect()                                         # starts, with a reminder
+    assert bot.account_id == 1 and any("Reminder" in r.message for r in caplog.records)
+    bot.store.close()
+
+
+def test_paper_mode_needs_no_auto_oco_confirmation(tmp_path):
+    from orbbot.bot import ORBBot
+    clock = FakeClock(datetime.combine(DAY, time(8, 0), ET))
+    bot = ORBBot(make_cfg(tmp_path), mode="paper", api=FakeBroker(clock), clock=clock, sleep=clock.advance)
+    bot.connect()
+    assert bot.account_id == 1
+    bot.store.close()
+
+
+# ---------------------------------------------------------------- slippage report
+def test_drill_report_lists_filled_drills_with_slippage_fees_and_latency(tmp_path):
+    from orbbot.drill import slippage_report
+    assert "No drill database" in slippage_report(tmp_path)
+    d, broker, cfg, out = _drill(tmp_path, broker_cls=PositionBrackets)
+    d.run()                                                   # a rejected run is not listed
+    d, broker, cfg, out = _drill(tmp_path, at=time(13, 5), on_sleep=_hit_target_once)
+    d.run()
+    tag = broker.place_calls[0]["tag"]
+    rep = slippage_report(tmp_path)
+    assert "Filled Practice drills (1)" in rep and tag in rep
+    line = next(x for x in rep.splitlines() if x.startswith(tag)).split()
+    # tag side last fill entry exit how order exit-ticks fees net place ack seen prot
+    assert line[1] == side_for(DAY) and line[4] == "1" and line[6] == "target" and line[8] == "0"
+    assert line[9] == "1.22" and line[11] == "0"            # fake fees; fake clock: 0 ms
+    assert "Mean entry slippage +1.00 ticks (n=1)" in rep and "mean fees $1.22 per round trip" in rep
+    assert "No valid entry slippage" not in rep
+    s = StateStore(tmp_path / "state-drill" / "drill.sqlite")    # a run from before the newest-bar fix
+    s.db.execute("UPDATE events SET detail = ? WHERE kind = 'drill_start' AND detail LIKE ?",
+                 (f"{tag}: long 1 MNQZ6, last price 20049.0", f"{tag}%"))
+    s.close()
+    rep = slippage_report(tmp_path)
+    assert f"No valid entry slippage for {tag}" in rep and "Mean entry slippage - ticks (n=0)" in rep
 
 
 def test_drill_command_requires_live(monkeypatch):

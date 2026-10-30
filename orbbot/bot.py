@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 from .api import ProjectXClient
 from .config import BotConfig, load_config
-from .execution import S, AccountGuard, ExecutionEngine, Freshness
+from .execution import S, AccountGuard, ExecutionEngine, Freshness, auto_oco_status, bracket_preflight
 from .features import Features
 from .filters import ESConfirm, Filtered
 from .journal import Journal
@@ -116,6 +116,14 @@ class ORBBot:
         acct = match[0]
         if not acct.get("canTrade", True) and self.mode == "live":
             raise SystemExit(f"Account {acct['name']} cannot trade right now")
+        if self.mode == "live":                 # bracket orders need Auto OCO Brackets on the account
+            why = bracket_preflight(acct, self.cfg.safety.auto_oco_confirmed)
+            if why:
+                log.critical("Live trading refused: %s", why)
+                raise SystemExit(f"Live trading refused: {why}")
+            if auto_oco_status(acct) is None:
+                log.warning("Reminder: the API can't report the bracket mode; relying on safety.auto_oco_confirmed "
+                            "(Auto OCO Brackets ON for %s)", acct["name"])
         self.account_id = acct["id"]
         log.info("Using account %s (id %s, balance %s) | mode=%s", acct["name"], acct["id"], acct.get("balance"), self.mode)
         self.resolve_contract()

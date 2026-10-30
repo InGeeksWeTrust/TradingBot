@@ -2,6 +2,47 @@
 
 Every change to the forward engine or its records during Phase 4. Each entry says what changed, why, and whether it affects comparability with earlier forward records. The frozen strategy (signals, confirmation, stops, targets, sizing, risk limits, trading window, forward-test settings) has not changed. The audit's config fingerprint is still `a6f638a7dc88463a`.
 
+## Drill follow-ups: Auto OCO preflight, audit, wording, slippage report (2026-10-30)
+
+### 1. Auto OCO Brackets preflight
+
+**What.**
+- `bot --live` and the drill now check at start-up that bracket orders can be sent.
+- ProjectX's Account/search reports only `id`, `name`, `balance`, `canTrade`, `isVisible` and `simulated` (checked 2026-10-30), so the bracket mode can't be read from the API.
+- If the account reports a field containing "oco" (in case ProjectX ever adds one), that value decides.
+- Otherwise both refuse to start until the new config attestation `safety.auto_oco_confirmed: true`. `bot --live` logs a CRITICAL line when it refuses, and a reminder when it starts on the attestation.
+- `config-sweep.yaml` gains `auto_oco_confirmed: false`. Set it to `true` only after checking TopstepX.
+- Paper mode needs no confirmation.
+- The broker's rejection text ("Brackets cannot be used with Position Brackets …") is now translated into a clear instruction. It is logged CRITICAL and recorded as a `bracket_mode_rejected` event.
+
+**Why.** The first two drills on 2026-10-30 were rejected for this reason, and every live bracket order would have been too.
+
+**Comparability.** None: start-up gating and message text only. `safety.*` (apart from `required_confirm_symbol`) is not part of the frozen fingerprint, which is unchanged.
+
+### 2. Drill audit: rejected runs
+
+**What.**
+- A drill the broker rejected before any fill, with the account verified flat after that run, is now **WARN** "rejected: <reason>" instead of FAIL.
+- FAIL remains for a run that didn't end flat, wasn't journaled, or filled and wasn't protected in time or closed.
+- Each run is checked against its own end record, the first `drill_end` after it started, not just the day's last one.
+- The drill section's status is FAIL, WARN or PASS accordingly.
+
+### 3. Wording
+
+**What.** "bar started Ns earlier" replaces "Ns old". A bar's timestamp is the minute it started; the current minute's bar carries the latest price.
+
+### 4. Drill slippage report
+
+**What.** `python -m orbbot.drill --report` (read-only; sends nothing) lists every filled drill:
+- entry slippage in ticks against the last price seen;
+- the stop/target fill against its order price;
+- fees and net;
+- latency: Order/place round trip, submit→ack, ack→fill seen, fill→protected.
+
+All tick figures are positive = worse for us, followed by means. Runs from before the newest-bar fix show no entry slippage and are left out of the mean.
+
+**Comparability.** Reporting only.
+
 ## Fix: newest bar for the drill's last price and the latency log (2026-10-30)
 
 **What.**

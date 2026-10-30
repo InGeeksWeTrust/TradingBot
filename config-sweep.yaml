@@ -68,6 +68,7 @@ account:                  # Topstep Maximum Loss Limit guard. A practice account
 
 safety:
   live_trading_enabled: false
+  auto_oco_confirmed: false   # set true only after checking TopstepX: Auto OCO Brackets ON (not Position Brackets)
   required_confirm_symbol: ES   # frozen forward test: refuse to start with any other confirmation market
   state_dir: state        # state/paper.sqlite: order intents, levels used, events, forward-test record
   halt_file: HALT         # create a file named HALT: no NEW entries, open trade stays managed

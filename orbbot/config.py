@@ -79,6 +79,8 @@ class ForwardTestConfig:
 @dataclass
 class SafetyConfig:
     live_trading_enabled: bool = False  # live orders also need --live on the command line
+    auto_oco_confirmed: bool = False    # you checked TopstepX has Auto OCO Brackets ON for the account (the API
+                                        # can't report it; Order/place with brackets is rejected without it)
     required_confirm_symbol: str = ""   # frozen test: refuse to start unless confirm_symbol is exactly this
     state_dir: str = "state"            # SQLite order/level/day state (one file per mode)
     halt_file: str = "HALT"             # create to stop NEW entries (open trades stay protected)

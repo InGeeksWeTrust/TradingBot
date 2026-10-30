@@ -2,10 +2,13 @@
 20-tick stop / 20-tick target bracket to the Topstep Practice account, then closes it.
 
     python -m orbbot.drill --config config-sweep.yaml --live
+    python -m orbbot.drill --report          # slippage/latency of every filled drill; sends nothing
 
 Run it supervised, 12:00-15:00 ET, while the paper bot is idle. Gates, all required:
   * --live on the command line (CLAUDE.md rule 2: real orders need an explicit opt-in; the config's
     safety.live_trading_enabled stays false, so the bot's own --live path stays disarmed)
+  * safety.auto_oco_confirmed: true (bracket orders are rejected unless the account has Auto OCO
+    Brackets on, and the API can't report that setting)
   * the hard-coded allowlist below: account id 28771375, named PRAC-V2-387652-21891938 (and any
     account whose name doesn't start with "PRAC-" is refused)
   * the operator types the account name exactly after seeing account, contract, side, size, bracket
@@ -41,7 +44,7 @@ from pathlib import Path
 from .api import ORDER_LIMIT, ProjectXClient
 from .bot import MONTHS, acquire_instance_lock
 from .config import BotConfig, load_config
-from .execution import STOP_TYPES, S, ExecutionEngine, Freshness, _ts
+from .execution import STOP_TYPES, S, ExecutionEngine, Freshness, _ts, bracket_preflight
 from .latency import Latency, TimedApi
 from .risk import ContractSpec
 from .state import StateStore
@@ -186,6 +189,10 @@ class Drill:
         raw = self.raw_api
         raw.login()
         acct = check_account(raw.search_accounts())
+        why = bracket_preflight(acct, cfg.safety.auto_oco_confirmed)
+        if why:
+            log.critical("Drill refused: %s", why)
+            raise Refused(why)
         spec, cname = self.find_contract(raw)
         self.check_flat(raw)
 
@@ -230,9 +237,9 @@ class Drill:
                 raise Refused("no current MNQ price available")
             newest = max(bars, key=lambda b: _ts(b["t"]))       # the API returns bars newest first
             age = (self.utc() - _ts(newest["t"])).total_seconds()
-            if age > 120:
-                raise Refused(f"newest MNQ bar is {age:.0f}s old ({newest['t']}); no current price to measure "
-                              f"slippage against")
+            if age > 120:                                         # bar time = the minute it started
+                raise Refused(f"newest MNQ bar started {age:.0f}s earlier ({newest['t']}); no current price to "
+                              f"measure slippage against")
             last_px = float(newest["c"])
             tag = f"{TAG_PREFIX}{day:%Y%m%d}-{side}-{uuid.uuid4().hex[:10]}"
             plan = {"stop_ticks": BRACKET_TICKS, "target_ticks": BRACKET_TICKS, "stop_pts": pts, "target_pts": pts,
@@ -245,7 +252,7 @@ class Drill:
             intent = store.intent(tag)
             eng.active = intent
             store.event("drill_start", f"{tag}: {side} {SIZE} {cname}, last price {last_px} "
-                                       f"(bar {newest['t']}, {age:.0f}s old)")
+                                       f"(bar {newest['t']} started {age:.0f}s earlier)")
             started = self.utc()
             eng.submit(intent, sl, tp)
             self._manage(eng, fresh, lat, expected, started)
@@ -271,7 +278,7 @@ class Drill:
                 res = eng.manage(fresh, expected)
                 it = eng.active
                 if it is not None and it["state"] == S.PROTECTED.value and not self.brackets:
-                    self._note_brackets(eng)
+                    self._note_brackets(eng, it["tag"])
                 if res == "flatten":
                     self.exit_reason = "protection missing"
                     self._flatten(eng, fresh, "drill: protection missing")
@@ -297,12 +304,12 @@ class Drill:
             except KeyboardInterrupt:
                 self.out("Still flattening; please wait ...")
 
-    def _note_brackets(self, eng: ExecutionEngine) -> None:
+    def _note_brackets(self, eng: ExecutionEngine, tag: str) -> None:
         mine = [o for o in eng.open_orders if o.get("contractId") == eng.spec.contract_id]
         stop = next((o for o in mine if o.get("type") in STOP_TYPES), None)
         tgt = next((o for o in mine if o.get("type") == ORDER_LIMIT), None)
         self.brackets = {"stop": stop and stop.get("stopPrice"), "target": tgt and tgt.get("limitPrice")}
-        eng.store.event("drill_brackets", json.dumps(self.brackets))
+        eng.store.event("drill_brackets", json.dumps(dict(self.brackets, tag=tag)))
 
     def _record(self, eng, store: StateStore, api, intent: dict, cname: str, acct: dict) -> None:
         """Exit fields of the forward row from the broker's fills."""
@@ -399,6 +406,75 @@ class Drill:
         self.out(f"  account at the end   {'FLAT, no working orders' if flat else 'NOT FLAT: CHECK THE ACCOUNT NOW'}")
 
 
+def slippage_report(root: Path = Path(".")) -> str:
+    """Every filled drill: entry vs the last price seen, stop/target fill vs its order price, fees, latency.
+    Reads state-drill/drill.sqlite read-only. Ticks are 'positive = worse for us'."""
+    p = drill_paths(root)["db"]
+    if not p.exists():
+        return f"No drill database at {p}"
+    db = sqlite3.connect(f"file:{p.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        intents = db.execute("SELECT tag, side, created_at FROM intents WHERE filled_qty > 0 ORDER BY created_at"
+                             ).fetchall()
+        all_created = [r[0] for r in db.execute("SELECT created_at FROM intents ORDER BY created_at")]
+        fwd = {r[0]: r for r in db.execute("SELECT tag, signal_price, fill_price, entry_slippage_ticks, stop_pts, "
+                                           "exit_price, exit_reason, fees, net_pnl FROM forward")}
+        brackets = [(at, json.loads(d)) for at, d in
+                    db.execute("SELECT at, detail FROM events WHERE kind = 'drill_brackets' ORDER BY id")]
+        trans = {t: {to: _ts(at) for at, to in reversed(db.execute(
+            "SELECT at, to_state FROM transitions WHERE tag = ? ORDER BY id", (t,)).fetchall())} for t, *_ in intents}
+        place = {t: ms for t, ms in db.execute("SELECT tag, ms FROM latency WHERE kind = 'api' AND name = 'place'")}
+        # runs before the newest-bar fix logged no bar time: their "last price" was the oldest bar of the window
+        starts = {d.split(":", 1)[0]: d for (d,) in db.execute("SELECT detail FROM events WHERE kind = 'drill_start'")}
+    finally:
+        db.close()
+    if not intents:
+        return "No filled drills yet."
+
+    def ms(st, a, b):
+        return f"{(st[b] - st[a]).total_seconds() * 1000:.0f}" if a in st and b in st else "-"
+
+    out = [f"Filled Practice drills ({len(intents)}). Ticks: positive = worse for us.", "",
+           f"{'tag':<34} {'side':<5} {'last':>10} {'fill':>10} {'entry':>6} {'exit':>10} {'how':<7} {'order':>10} "
+           f"{'exit':>5} {'fees':>6} {'net':>8} {'place':>6} {'ack':>5} {'seen':>5} {'prot':>5}",
+           f"{'':<34} {'':<5} {'price':>10} {'price':>10} {'ticks':>6} {'price':>10} {'':<7} {'price':>10} "
+           f"{'ticks':>5} {'$':>6} {'$':>8} {'ms':>6} {'ms':>5} {'ms':>5} {'ms':>5}"]
+    entry_ticks, exit_ticks, fees, invalid = [], [], [], []
+    for tag, side, created in intents:
+        _, last, fill, slip, stop_pts, exit_px, reason, fee, net = fwd.get(tag, (tag,) + (None,) * 8)
+        tick = (stop_pts or BRACKET_TICKS * 0.25) / BRACKET_TICKS
+        if "(bar " not in starts.get(tag, ""):
+            last = slip = None                    # no valid last price for this run (see above)
+            invalid.append(tag)
+        nxt = next((c for c in all_created if c > created), None)
+        br = next((b for at, b in brackets if b.get("tag") == tag), None) or next(
+            (b for at, b in brackets if "tag" not in b and at >= created and (nxt is None or at < nxt)), {})
+        order = br.get("stop") if reason == "stop" else br.get("target") if reason == "target" else None
+        xt = None
+        if order is not None and exit_px is not None:
+            xt = (exit_px - order) * (1 if side == "short" else -1) / tick + 0.0   # + 0.0: no "-0"
+            exit_ticks.append(xt)
+        if slip is not None:
+            entry_ticks.append(slip)
+        if fee is not None:
+            fees.append(fee)
+        st = trans[tag]
+        f = lambda v, w, d=2: f"{v:>{w}.{d}f}" if v is not None else f"{'-':>{w}}"   # noqa: E731
+        out.append(f"{tag:<34} {side:<5} {f(last, 10)} {f(fill, 10)} {f(slip, 6, 0)} {f(exit_px, 10)} "
+                   f"{reason or '-':<7} {f(order, 10)} {f(xt, 5, 0)} {f(fee, 6)} {f(net, 8)} "
+                   f"{f(place.get(tag), 6, 0)} {ms(st, 'SUBMITTING', 'ACKNOWLEDGED'):>5} "
+                   f"{ms(st, 'ACKNOWLEDGED', 'FILLED'):>5} {ms(st, 'FILLED', 'PROTECTED'):>5}")
+    avg = lambda xs, sign="+": f"{sum(xs) / len(xs):{sign}.2f}" if xs else "-"   # noqa: E731
+    out += ["", f"Mean entry slippage {avg(entry_ticks)} ticks (n={len(entry_ticks)}); mean stop/target fill vs "
+                f"order {avg(exit_ticks)} ticks (n={len(exit_ticks)}); mean fees ${avg(fees, '')} per round trip",
+            "place = Order/place round trip; ack = SUBMITTING->ACKNOWLEDGED; seen = ACKNOWLEDGED->FILLED; "
+            "prot = FILLED->PROTECTED"]
+    if invalid:
+        out.append(f"No valid entry slippage for {', '.join(invalid)}: run before the newest-bar fix (its 'last "
+                   f"price' was the oldest bar of the lookup window); left out of the mean")
+    return "\n".join(out) + "\n"
+
+
 def setup_logging(log_dir: str) -> None:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s")
@@ -419,7 +495,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Practice-account execution drill: one REAL 1-lot MNQ order")
     ap.add_argument("--config", default="config-sweep.yaml")
     ap.add_argument("--live", action="store_true", help="required: this sends a real order to the Practice account")
+    ap.add_argument("--report", action="store_true", help="print the slippage report of past drills; sends nothing")
     a = ap.parse_args()
+    if a.report:
+        print(slippage_report(), end="")
+        return
     if not a.live:
         raise SystemExit("The drill sends a REAL order to the Practice account. Re-run with --live to proceed.")
     cfg = load_config(a.config)

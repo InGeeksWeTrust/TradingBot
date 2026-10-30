@@ -39,7 +39,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 
 from .config import BotConfig, load_config
-from .execution import ALLOWED, S, AccountGuard
+from .execution import ALLOWED, S, AccountGuard, explain_rejection
 from .state import StateStore
 from .strategy import ET
 
@@ -81,6 +81,8 @@ def _log_lines(log_dir: Path, day: date):
 def drill_section(cfg: BotConfig, day: date, root: Path) -> tuple[list[str], float | None]:
     """The Practice-account drill's own checks for `day` (orbbot/drill.py), read-only from
     state-drill/drill.sqlite. Separate from Strategy A: never part of its checks or overall result.
+    Per run: FAIL if it didn't end flat, wasn't journaled, or filled and wasn't protected in time / closed;
+    a run the broker rejected before any fill, with the account verified flat after it, is a WARN.
     Returns the report lines and the day's drill net P&L (None if no drill that day)."""
     from .drill import JOURNAL_DIR, STATE_DIR
     p = root / STATE_DIR / "drill.sqlite"
@@ -88,14 +90,14 @@ def drill_section(cfg: BotConfig, day: date, root: Path) -> tuple[list[str], flo
         return [], None
     db = sqlite3.connect(f"file:{p.resolve().as_posix()}?mode=ro", uri=True)
     try:
-        intents = db.execute("SELECT tag, state, filled_qty FROM intents WHERE day = ? ORDER BY created_at",
+        intents = db.execute("SELECT tag, state, filled_qty, created_at FROM intents WHERE day = ? ORDER BY created_at",
                              (day.isoformat(),)).fetchall()
         if not intents:
             return [], None
         fwd = {r[0]: r[1:] for r in db.execute("SELECT tag, net_pnl, fill_price, exit_price, exit_reason FROM forward")}
-        ends = [d for at, d in db.execute("SELECT at, detail FROM events WHERE kind = 'drill_end' ORDER BY id")
-                if _et_date(at) == day]
-        trans = {t: db.execute("SELECT at, to_state FROM transitions WHERE tag = ? ORDER BY id", (t,)).fetchall()
+        ends = [(datetime.fromisoformat(at), d) for at, d in
+                db.execute("SELECT at, detail FROM events WHERE kind = 'drill_end' ORDER BY id")]
+        trans = {t: db.execute("SELECT at, to_state, detail FROM transitions WHERE tag = ? ORDER BY id", (t,)).fetchall()
                  for t, *_ in intents}
     finally:
         db.close()
@@ -106,13 +108,26 @@ def drill_section(cfg: BotConfig, day: date, root: Path) -> tuple[list[str], flo
             journaled = {r["tag"] for r in csv.DictReader(f)}
     rows: list[tuple[str, str]] = []
     pnl = 0.0
-    for tag, state, filled in intents:
-        first = {}
-        for at, to in trans[tag]:
+    for tag, state, filled, created in intents:
+        first, detail = {}, {}
+        for at, to, d in trans[tag]:
             first.setdefault(to, datetime.fromisoformat(at))
+            detail.setdefault(to, d or "")
         net, fill, exit_px, reason = fwd.get(tag, (None, None, None, None))
         pnl += net or 0.0
-        rows.append((PASS if filled else FAIL, f"{tag}: opened" + (f", fill {fill}" if filled else ": never filled")))
+        # this run's own end check: the first drill_end recorded after the run started
+        end = next((d for at, d in ends if at >= datetime.fromisoformat(created)), None)
+        flat = end is not None and end.startswith("flat")
+        rows.append((PASS if flat else FAIL, f"{tag}: account at the end: {end or 'no drill_end record'}"))
+        rows.append((PASS if tag in journaled else FAIL, f"{tag}: " + ("journaled in " if tag in journaled else
+                                                                       "no row in ") + f"{JOURNAL_DIR}/drill.csv"))
+        if not filled:
+            if state in (S.REJECTED.value, S.CANCELLED.value) and flat:
+                rows.append((WARN, f"{tag}: rejected: {explain_rejection(detail.get(state) or state)}"))
+            else:
+                rows.append((FAIL, f"{tag}: never filled, final state {state}"))
+            continue
+        rows.append((PASS, f"{tag}: opened, fill {fill}"))
         if filled:
             t_fill = first.get("FILLED") or first.get("PARTIALLY_FILLED")
             t_prot = first.get("PROTECTED")
@@ -123,11 +138,7 @@ def drill_section(cfg: BotConfig, day: date, root: Path) -> tuple[list[str], flo
                                                              if secs is not None else "never verified PROTECTED")))
         rows.append((PASS if state == S.CLOSED.value else FAIL, f"{tag}: final state {state}"
                      + (f", exit {exit_px} ({reason}), net ${net}" if exit_px is not None else "")))
-        rows.append((PASS if tag in journaled else FAIL, f"{tag}: " + ("journaled in " if tag in journaled else
-                                                                       "no row in ") + f"{JOURNAL_DIR}/drill.csv"))
-    flat = bool(ends) and ends[-1].startswith("flat")
-    rows.append((PASS if flat else FAIL, f"account at the end: {ends[-1] if ends else 'no drill_end record'}"))
-    status = FAIL if any(s == FAIL for s, _ in rows) else PASS
+    status = FAIL if any(s == FAIL for s, _ in rows) else WARN if any(s == WARN for s, _ in rows) else PASS
     lines = ["", "## Practice-account drill (separate from Strategy A; not part of its overall result)", "",
              f"**Drill: {status}** - net P&L ${pnl:+.2f}: a real Practice-account trade, so it is in the account "
              "balance the paper bot reads and in today's end-of-day balance (MLL floor history)", "",
