@@ -149,7 +149,7 @@ class TimedApi:
             name = f"bars {self._symbols.get(cid, cid)}"
             if start is not None and end is not None and end - start > timedelta(days=1):
                 name += " history"
-            last = out[-1] if out else None
+            last = max(out, key=lambda b: str(b.get("t"))) if out else None   # the API returns newest first
             lat.api(name, t0, t1, ok, bar_t=last and last.get("t"), price=last and float(last["c"]),
                     detail=f"{len(out or [])} bars")
         elif attr == "place_order":

@@ -209,6 +209,37 @@ def test_drill_refuses_a_second_instance(tmp_path):
         held.close()
 
 
+class NewestFirst(PracBroker):
+    """Like ProjectX: History/retrieveBars returns the newest bar first."""
+
+    def retrieve_bars(self, *a, **kw):
+        return list(reversed(super().retrieve_bars(*a, **kw)))
+
+
+def _per_minute(t):
+    c = 20000 + t.astimezone(ET).minute          # each minute closes at a different price
+    return (c, c + 1, c - 1, c)
+
+
+def test_drill_last_price_is_the_newest_bar_even_when_bars_come_newest_first(tmp_path):
+    d, broker, cfg, out = _drill(tmp_path, on_sleep=_hit_target_once, broker_cls=NewestFirst, price_fn=_per_minute)
+    assert d.run() == 0
+    fwd = _states(tmp_path)[2]
+    assert fwd["signal_price"] == 20000 + 0               # the 13:00 bar, not 12:55 (the window's oldest)
+    assert abs(fwd["entry_slippage_ticks"]) == 1          # the fake fills 1 tick from that close
+    lat = StateStore(tmp_path / "state-drill" / "drill.sqlite")
+    row = lat.db.execute("SELECT bar_t, price FROM latency WHERE name='bars MNQ' ORDER BY id LIMIT 1").fetchone()
+    lat.close()
+    assert row[0].startswith(f"{DAY}T17:00") and row[1] == 20000   # latency log: newest bar too
+
+
+def test_drill_refuses_when_the_newest_bar_is_stale(tmp_path):
+    d, broker, cfg, out = _drill(tmp_path, bars_stop_at=datetime.combine(DAY, time(12, 55), ET))
+    with pytest.raises(Refused, match="newest MNQ bar is 300s old"):
+        d.run()
+    assert broker.place_calls == []
+
+
 def test_drill_command_requires_live(monkeypatch):
     from orbbot import drill
     monkeypatch.setattr("sys.argv", ["drill", "--config", "config-sweep.yaml"])

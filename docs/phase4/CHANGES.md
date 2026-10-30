@@ -2,6 +2,17 @@
 
 Every change to the forward engine or its records during Phase 4. Each entry says what changed, why, and whether it affects comparability with earlier forward records. The frozen strategy (signals, confirmation, stops, targets, sizing, risk limits, trading window, forward-test settings) has not changed. The audit's config fingerprint is still `a6f638a7dc88463a`.
 
+## Fix: newest bar for the drill's last price and the latency log (2026-10-30)
+
+**What.**
+- ProjectX History/retrieveBars returns bars **newest first**. The drill took `bars[-1]` as the last price, which is the oldest bar in its 5-minute lookup window. The per-API-call rows of the latency log did the same for their `bar_t` and `price`.
+- Both now take the newest bar by timestamp.
+- The drill also refuses to send if that newest bar is more than 2 minutes old.
+
+**Why.** The first filled drill (`DRILL-20261030-short-530e6e5a66`) recorded "−38 ticks" of slippage against a price 5 minutes old, so that run has no valid slippage measurement. Its fill (28,479.00), stop (28,484.00), target (28,474.00), stop exit at 28,484.00, 101 ms submit-to-ack and −$10.72 net are correct.
+
+**Comparability.** Strategy A is not affected: the bot (`feed_bars`) and the paper broker already sorted bars by time, so signals and paper fills were always right. The per-poll latency rows and the latency report's figures were also right.
+
 ## Task 7: Practice-account execution drill (2026-10-30)
 
 **What.** `python -m orbbot.drill --config config-sweep.yaml --live` (`orbbot/drill.py`) sends one **real** 1-lot MNQ market order to the Topstep Practice account and closes it. It is built only for a supervised run.

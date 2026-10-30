@@ -41,7 +41,7 @@ from pathlib import Path
 from .api import ORDER_LIMIT, ProjectXClient
 from .bot import MONTHS, acquire_instance_lock
 from .config import BotConfig, load_config
-from .execution import STOP_TYPES, S, ExecutionEngine, Freshness
+from .execution import STOP_TYPES, S, ExecutionEngine, Freshness, _ts
 from .latency import Latency, TimedApi
 from .risk import ContractSpec
 from .state import StateStore
@@ -228,7 +228,12 @@ class Drill:
                                      self.utc() + timedelta(minutes=1), include_partial=True)
             if not bars:
                 raise Refused("no current MNQ price available")
-            last_px = float(bars[-1]["c"])
+            newest = max(bars, key=lambda b: _ts(b["t"]))       # the API returns bars newest first
+            age = (self.utc() - _ts(newest["t"])).total_seconds()
+            if age > 120:
+                raise Refused(f"newest MNQ bar is {age:.0f}s old ({newest['t']}); no current price to measure "
+                              f"slippage against")
+            last_px = float(newest["c"])
             tag = f"{TAG_PREFIX}{day:%Y%m%d}-{side}-{uuid.uuid4().hex[:10]}"
             plan = {"stop_ticks": BRACKET_TICKS, "target_ticks": BRACKET_TICKS, "stop_pts": pts, "target_pts": pts,
                     "risk": pts * pv * SIZE, "cost": cfg.risk.fee_per_contract_rt * SIZE, "level": "drill",
@@ -239,7 +244,8 @@ class Drill:
                           planned_cost=plan["cost"], mode="drill")
             intent = store.intent(tag)
             eng.active = intent
-            store.event("drill_start", f"{tag}: {side} {SIZE} {cname}, last price {last_px}")
+            store.event("drill_start", f"{tag}: {side} {SIZE} {cname}, last price {last_px} "
+                                       f"(bar {newest['t']}, {age:.0f}s old)")
             started = self.utc()
             eng.submit(intent, sl, tp)
             self._manage(eng, fresh, lat, expected, started)
