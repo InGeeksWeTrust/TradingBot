@@ -2,6 +2,53 @@
 
 Every change to the forward engine or its records during Phase 4. Each entry says what changed, why, and whether it affects comparability with earlier forward records. The frozen strategy (signals, confirmation, stops, targets, sizing, risk limits, trading window, forward-test settings) has not changed. The audit's config fingerprint is still `a6f638a7dc88463a`.
 
+## Task 7: Practice-account execution drill (2026-10-30)
+
+**What.** `python -m orbbot.drill --config config-sweep.yaml --live` (`orbbot/drill.py`) sends one **real** 1-lot MNQ market order to the Topstep Practice account and closes it. It is built only for a supervised run.
+
+**The order.**
+- 1 MNQ at market. The side alternates by date: an even date ordinal is long, odd is short.
+- 20-tick stop and 20-tick target brackets ($10 each on 1 MNQ), measured from the fill.
+- It goes through `ExecutionEngine`, the same engine as the bot. Order/place is sent once, and any ambiguous result is reconciled by customTag (prefix `DRILL-`), never resent.
+- The stop must be verified within `protection_grace_s` (15 s); otherwise the position is flattened via Position/closeContract.
+- A position still open after 10 minutes is closed. Ctrl+C flattens and verifies flat.
+
+**Gates (all required, checked before anything is sent):**
+1. `--live` on the command line. CLAUDE.md rule 2 requires real orders to need `--live` *and* `safety.live_trading_enabled`. For the drill, Pete chose `--live` plus the drill's own gates below, and the config switch stays `false`, so the bot's own `--live` path stays disarmed. **The drill is a deliberate, narrow exception to rule 2's config switch.**
+2. A hard-coded allowlist: account id 28771375 named `PRAC-V2-387652-21891938`. Any other id is refused, and so is any account whose name doesn't start with `PRAC-`.
+3. Operator authorization. The drill prints the account, contract, side, size and bracket, and the operator must type the account name exactly. Anything else aborts.
+4. 12:00-15:00 ET on a weekday.
+5. The paper bot must be idle: outside its session times, and no paper heartbeat in the last 2 minutes.
+6. No open intent in `state/paper.sqlite`, which the drill opens **read-only**.
+7. The real account has no position and no working order on any contract.
+8. Its own lock, `state-drill/drill.lock`.
+
+The window, paper-bot, intent and account checks are repeated after the account name is typed.
+
+**Isolation.**
+- State: `state-drill/drill.sqlite` (intents, transitions, events, forward row, and its own latency table).
+- Journal: `journal-drill/drill.csv`.
+- Log: `logs/drill-YYYYMMDD.log`. The Strategy A audit's log scan reads only `orbbot-*.log`.
+- `state/paper.sqlite`, `state/paper_broker.json` and `journal/paper.*` are never written. The tests check this.
+- Latency: `python -m orbbot.latency_report --db state-drill/drill.sqlite`.
+
+**Summary printed at the end:**
+- every state transition with timestamps;
+- submit-to-ack latency;
+- the fill against the last price at submission (real slippage, in ticks);
+- the bracket prices at the broker, the exit and net P&L;
+- whether the account is flat with no working orders.
+
+**Audit.**
+- A separate "Practice-account drill" section, with its own PASS/FAIL. It passes when the drill opened, was protected within `protection_grace_s`, closed, ended flat, and was journaled.
+- It is appended after the Strategy A table and is not part of the overall result. Strategy A's checks, counts and fingerprint are unchanged.
+- On a drill day, the Strategy A end-of-day balance row adds "includes Practice drill P&L $X". This matters because the paper broker's balance is the real account balance plus simulated P&L, so the drill's real P&L enters that day's end-of-day balance and the MLL floor history.
+
+**Comparability.**
+- Strategy A's signals, fills, P&L and journal are unaffected.
+- On a drill day, the end-of-day balance (and so the MLL floor) includes the drill's real P&L. The audit row states the amount.
+- The paper bot's daily loss/profit guard reads only simulated trades, so the drill can't change it.
+
 ## 4A follow-ups (2026-10-29)
 
 ### 1. Latency instrumentation (logging only)

@@ -2,6 +2,7 @@
 
     python -m orbbot.latency_report --config config-sweep.yaml
     python -m orbbot.latency_report --config config-sweep.yaml --since 2026-11-02 --until 2026-11-06
+    python -m orbbot.latency_report --db state-drill/drill.sqlite        # the Practice drill
 
 Prints p50 / p95 / p99 / max for each API call, the poll, how long after each minute starts the
 first poll receives that minute's bar, and each signal stage. Opens the database read-only.
@@ -111,9 +112,10 @@ def main() -> None:
     ap.add_argument("--mode", default="paper", choices=["paper", "live"])
     ap.add_argument("--since", help="first day, YYYY-MM-DD")
     ap.add_argument("--until", help="last day, YYYY-MM-DD")
+    ap.add_argument("--db", help="another state database, e.g. state-drill/drill.sqlite")
     a = ap.parse_args()
     cfg = load_config(a.config)
-    print(report(Path(cfg.safety.state_dir) / f"{a.mode}.sqlite", a.since, a.until), end="")
+    print(report(Path(a.db) if a.db else Path(cfg.safety.state_dir) / f"{a.mode}.sqlite", a.since, a.until), end="")
 
 
 if __name__ == "__main__":

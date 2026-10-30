@@ -33,6 +33,7 @@ import csv
 import hashlib
 import json
 import re
+import sqlite3
 from dataclasses import asdict
 from datetime import date, datetime, time
 from pathlib import Path
@@ -77,6 +78,63 @@ def _log_lines(log_dir: Path, day: date):
                 yield line
 
 
+def drill_section(cfg: BotConfig, day: date, root: Path) -> tuple[list[str], float | None]:
+    """The Practice-account drill's own checks for `day` (orbbot/drill.py), read-only from
+    state-drill/drill.sqlite. Separate from Strategy A: never part of its checks or overall result.
+    Returns the report lines and the day's drill net P&L (None if no drill that day)."""
+    from .drill import JOURNAL_DIR, STATE_DIR
+    p = root / STATE_DIR / "drill.sqlite"
+    if not p.exists():
+        return [], None
+    db = sqlite3.connect(f"file:{p.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        intents = db.execute("SELECT tag, state, filled_qty FROM intents WHERE day = ? ORDER BY created_at",
+                             (day.isoformat(),)).fetchall()
+        if not intents:
+            return [], None
+        fwd = {r[0]: r[1:] for r in db.execute("SELECT tag, net_pnl, fill_price, exit_price, exit_reason FROM forward")}
+        ends = [d for at, d in db.execute("SELECT at, detail FROM events WHERE kind = 'drill_end' ORDER BY id")
+                if _et_date(at) == day]
+        trans = {t: db.execute("SELECT at, to_state FROM transitions WHERE tag = ? ORDER BY id", (t,)).fetchall()
+                 for t, *_ in intents}
+    finally:
+        db.close()
+    jp = root / JOURNAL_DIR / "drill.csv"
+    journaled = set()
+    if jp.exists():
+        with jp.open() as f:
+            journaled = {r["tag"] for r in csv.DictReader(f)}
+    rows: list[tuple[str, str]] = []
+    pnl = 0.0
+    for tag, state, filled in intents:
+        first = {}
+        for at, to in trans[tag]:
+            first.setdefault(to, datetime.fromisoformat(at))
+        net, fill, exit_px, reason = fwd.get(tag, (None, None, None, None))
+        pnl += net or 0.0
+        rows.append((PASS if filled else FAIL, f"{tag}: opened" + (f", fill {fill}" if filled else ": never filled")))
+        if filled:
+            t_fill = first.get("FILLED") or first.get("PARTIALLY_FILLED")
+            t_prot = first.get("PROTECTED")
+            secs = (t_prot - t_fill).total_seconds() if t_prot and t_fill else None
+            ok = secs is not None and secs <= cfg.safety.protection_grace_s
+            rows.append((PASS if ok else FAIL, f"{tag}: " + (f"protected {secs:.1f}s after the fill was seen "
+                                                             f"(limit {cfg.safety.protection_grace_s:.0f}s)"
+                                                             if secs is not None else "never verified PROTECTED")))
+        rows.append((PASS if state == S.CLOSED.value else FAIL, f"{tag}: final state {state}"
+                     + (f", exit {exit_px} ({reason}), net ${net}" if exit_px is not None else "")))
+        rows.append((PASS if tag in journaled else FAIL, f"{tag}: " + ("journaled in " if tag in journaled else
+                                                                       "no row in ") + f"{JOURNAL_DIR}/drill.csv"))
+    flat = bool(ends) and ends[-1].startswith("flat")
+    rows.append((PASS if flat else FAIL, f"account at the end: {ends[-1] if ends else 'no drill_end record'}"))
+    status = FAIL if any(s == FAIL for s, _ in rows) else PASS
+    lines = ["", "## Practice-account drill (separate from Strategy A; not part of its overall result)", "",
+             f"**Drill: {status}** - net P&L ${pnl:+.2f}: a real Practice-account trade, so it is in the account "
+             "balance the paper bot reads and in today's end-of-day balance (MLL floor history)", "",
+             "| Status | Detail |", "| --- | --- |"] + [f"| {s} | {d.replace('|', '/')} |" for s, d in rows]
+    return lines, round(pnl, 2)
+
+
 def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")) -> tuple[str, str]:
     state_dir = root / cfg.safety.state_dir
     store = StateStore(state_dir / f"{mode}.sqlite")
@@ -87,6 +145,7 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
 
     intents = store.intents_for_day(day)
     events = [e for e in store.events() if _et_date(e[0]) == day]
+    drill_lines, drill_pnl = drill_section(cfg, day, root)
     fwd = {r["tag"]: r for r in store.forward_rows() if r.get("day") == day.isoformat()}
     used = store.used_levels(day)
 
@@ -211,8 +270,10 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
             f"last EOD day {store.get('last_eod_day')}, peak EOD {store.get('peak_eod_balance')}")
         eods = [e for e in store.events("eod_balance") if e[2].startswith(day.isoformat())]
         add("4 account", PASS if eods else WARN,
-            f"end-of-day balance recorded for {day}: {eods[-1][2]}" if eods else
-            f"no end-of-day balance recorded for {day} yet (bot must be running 3:10-5:00 PM CT)")
+            (f"end-of-day balance recorded for {day}: {eods[-1][2]}" if eods else
+             f"no end-of-day balance recorded for {day} yet (bot must be running 3:10-5:00 PM CT)")
+            + (f"; includes Practice drill P&L ${drill_pnl:+.2f} (real trade, see the drill section)"
+               if drill_pnl is not None else ""))
     else:
         add("4 account", PASS, "account guard off (account.max_loss_limit = 0)")
 
@@ -289,6 +350,7 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
              f"Signals/trades today: {len(intents)} entry intent(s); levels used {sorted(used) or 'none'}", "",
              "| Area | Status | Detail |", "| --- | --- | --- |"]
     lines += [f"| {a} | {s} | {d.replace('|', '/')} |" for a, s, d in checks]
+    lines += drill_lines                       # its own section and status; `overall` is Strategy A's only
     text = "\n".join(lines) + "\n"
     out = root / "audit" / f"{day}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
