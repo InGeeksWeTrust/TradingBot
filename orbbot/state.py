@@ -65,7 +65,14 @@ CREATE TABLE IF NOT EXISTS forward (
 """
 # columns added after the first release; added to existing files on open
 FORWARD_ADDED = {"fill_source": "TEXT", "modeled_slippage_ticks": "REAL", "market_drift_ticks": "REAL",
-                 "confirm_contract": "TEXT"}
+                 "confirm_contract": "TEXT", "note": "TEXT", "entry_bar_high": "REAL", "entry_bar_low": "REAL"}
+# When the note column is added, rows already holding equity_after were written by the old code,
+# which took it from a cached account balance that could predate the exit. Their values are kept
+# as recorded; the note says so and gives equity_before + net_pnl.
+STALE_EQUITY_NOTE = """UPDATE forward SET note = 'equity_after recorded from a stale account snapshot (before the fix)'
+    || CASE WHEN equity_before IS NOT NULL AND net_pnl IS NOT NULL
+            THEN '; equity_before + net_pnl = ' || printf('%.2f', equity_before + net_pnl) ELSE '' END
+    WHERE equity_after IS NOT NULL"""
 
 
 def utcnow() -> str:
@@ -97,6 +104,8 @@ class StateStore:
             for col, typ in FORWARD_ADDED.items():
                 if col not in have:
                     db.execute(f"ALTER TABLE forward ADD COLUMN {col} {typ}")
+                    if col == "note":
+                        db.execute(STALE_EQUITY_NOTE)
             db.execute("PRAGMA journal_mode=WAL")
             return db
         except sqlite3.DatabaseError as e:

@@ -39,6 +39,7 @@ from .execution import S, AccountGuard, ExecutionEngine, Freshness
 from .features import Features
 from .filters import ESConfirm, Filtered
 from .journal import Journal
+from .latency import Latency, TimedApi
 from .paper import PaperClient
 from .risk import ContractSpec, DailyGuard, plan_trade, realized_from_trades, trading_day_start, unrealized
 from .state import StateError, StateStore
@@ -239,6 +240,9 @@ class Session:
         self.stale_since: datetime | None = None
         self.mfe = self.mae = 0.0
         self.last_beat: datetime | None = None
+        self.lat: Latency | None = None
+        self.latest_bar_t: str | None = None            # newest bar timestamp received (latency log)
+        self.entry_watch: tuple[str, datetime] | None = None   # (tag, entry minute) awaiting that bar's range
 
     # ------------------------------------------------------------------ helpers
     def utc(self) -> datetime:
@@ -283,9 +287,15 @@ class Session:
         b = self.bot
         b.resolve_contract()
         self.spec = b.spec
+        self.lat = Latency(self.store, self.day, self.utc)
+        symbols = {self.spec.contract_id: self.cfg.symbol.upper()}
+        if b.confirm_spec:
+            symbols[b.confirm_spec.contract_id] = self.cfg.confirm_symbol.upper()
+        self.api = TimedApi(b.api, self.lat, symbols)
         self.fresh = Freshness(self.cfg.safety, self.utc)
         self.engine = ExecutionEngine(self.api, self.store, b.account_id, self.spec, self.cfg.safety,
                                       clock=self.utc, sleep=b.sleep, mode=b.mode)
+        self.engine.on_transition = self.lat.on_transition
         self.acct = AccountGuard(self.cfg.account, self.store)
         self.guard = DailyGuard(self.cfg.risk)
         d = self.store.day(self.day)
@@ -451,6 +461,9 @@ class Session:
         fees = sum(float(f.get("fees") or 0) for f in fills)
         net = gross - fees if self.cfg.risk.include_fees_in_pnl else gross
         plan = intent.get("plan") or {}
+        # equity after = equity before + this trade's net (the cached account balance can predate the exit)
+        before = next((r.get("equity_before") for r in self.store.forward_rows() if r["tag"] == intent["tag"]), None)
+        after = round(before + net, 2) if before is not None else None
         if reason is None:
             move = (exit_px - entry) * (1 if intent["side"] == "long" else -1)
             reason = ("target" if move >= 0.5 * plan.get("target_pts", 0) else
@@ -463,10 +476,17 @@ class Session:
             "risk_usd": round(plan.get("risk", 0), 2), "pnl_usd": round(net, 2)})
         self.store.forward(intent["tag"], exit_time=closes[-1]["creationTimestamp"], exit_price=round(exit_px, 2),
                            exit_reason=reason, gross_pnl=round(gross, 2), fees=round(fees, 2), net_pnl=round(net, 2),
-                           mfe_pts=self.mfe, mae_pts=self.mae, equity_after=self.acct.balance)
+                           mfe_pts=self.mfe, mae_pts=self.mae, equity_after=after)
 
     # ------------------------------------------------------------------ the poll
     def poll(self) -> str:
+        self.lat.begin_poll()
+        try:
+            return self._poll()
+        finally:
+            self.lat.end_poll(self.latest_bar_t, self.last_price)
+
+    def _poll(self) -> str:
         cfg, s, eng = self.cfg, self.s, self.engine
         now = self.now()
         self.beat()
@@ -590,7 +610,17 @@ class Session:
         cur_minute = now.replace(second=0, microsecond=0)
         if bars:
             self.last_price = bars[-1].c
+            self.latest_bar_t = bars[-1].t.isoformat()
         done = [b for b in bars if b.t.astimezone(ET) < cur_minute]
+        if self.entry_watch:     # the entry minute's range, for the audit's paper-uncertain flag
+            tag, minute = self.entry_watch
+            eb = next((b for b in done if b.t == minute), None)
+            if eb is not None:
+                self.entry_watch = None
+                try:
+                    self.store.forward(tag, entry_bar_high=eb.h, entry_bar_low=eb.l)
+                except StateError:
+                    pass
         if done:
             self.fresh.bar("bars", done[-1].t)
         elif self.last_bar_t is not None:
@@ -617,6 +647,14 @@ class Session:
                     self.store.event("signal_filtered", f"{sorted(new_used)} at {b.t.astimezone(ET):%H:%M} (confirmation disagreed)")
                 continue
             sig.level = level
+            sig.lat_key = key = f"{sig.side} {level} {sig.time.astimezone(ET):%H:%M}"
+            self.lat.stage("bar_close", sig.time, sig=key)
+            if self.lat.poll is not None:
+                self.lat.stage("poll_start", self.lat.poll, sig=key)
+            got = self.lat.last_end.get(f"bars {self.cfg.symbol.upper()}")
+            if got is not None:
+                self.lat.stage("bars_received", got, sig=key)
+            self.lat.stage("recognized", self.utc(), sig=key)
             if now - sig.time > timedelta(minutes=2):
                 self.strat.register_entry(sig.side)
                 self.store.event("signal_stale", f"{sig.side} {level} at {sig.time.astimezone(ET):%H:%M} (bot started after it)")
@@ -645,8 +683,10 @@ class Session:
     def consider(self, sig, now: datetime) -> None:
         level = getattr(sig, "level", None)
         tm = sig.time.astimezone(ET).strftime("%H:%M")
+        key = getattr(sig, "lat_key", None)
         why = self.entry_blockers(now, sig)
         if why:
+            self.lat.stage("risk_done", self.utc(), sig=key, detail="blocked")
             # Same accounting as the backtest: a signal that arrives while a trade is open (or after the
             # day is halted) is not counted; one refused for any other reason uses up a trade slot.
             if not (self.halted or self.engine.active is not None or self.engine.position()):
@@ -657,11 +697,14 @@ class Session:
         reasons: list = []
         plan = plan_trade(sig, self.cfg.risk, self.spec, self.realized, self.bot.contracts, reasons)
         if plan is None:
+            self.lat.stage("risk_done", self.utc(), sig=key, detail="skipped")
             self.strat.register_entry(sig.side)
             self.store.event("signal_skipped", f"{sig.side} {level} at {tm}: {reasons[0] if reasons else '?'}")
             log.info("%s signal at %s ET skipped: %s", sig.side, tm, reasons[0] if reasons else "no size fits")
             return
         room = self.acct.headroom(0.0)
+        self.lat.stage("risk_done", self.utc(), sig=key,
+                       detail=None if room is not None and room >= plan.worst_case_loss else "blocked")
         if room is None:
             self.strat.register_entry(sig.side)
             self.store.event("signal_blocked", f"{sig.side} {level} at {tm}: account balance or MLL unknown")
@@ -683,8 +726,11 @@ class Session:
         except StateError:
             self.engine.block("state", "could not record the order intent; nothing was sent")
             return
+        if key:
+            self.lat.assign(key, intent["tag"])
         self.mfe = self.mae = 0.0
         self._last_tag = intent["tag"]
+        self.entry_watch = (intent["tag"], self.utc().replace(second=0, microsecond=0))
         self.engine.submit(intent, sl, tp)
 
 

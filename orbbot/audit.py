@@ -13,7 +13,8 @@ Checks
   2 Level consumption: every level the strategy reacted to (traded, filtered by the confirmation,
     blocked, skipped, stale) is recorded as used; no level is traded twice; trades <= the daily cap.
   3 Lifecycle: each intent's state changes follow the allowed transitions; filled trades were
-    protected (or flattened) and have fill, exit, fees and P&L recorded.
+    protected (or flattened) and have fill, exit, fees and P&L recorded. A paper trade whose entry
+    minute's high (short) or low (long) reached its stop is listed as INFO "paper-uncertain".
   4 Account guard: the Maximum Loss Limit floor, whether it rests on an approximate end-of-day
     balance, and the room above the buffer.
   5 Operational events: CRITICAL log lines, failed flattens, crashes, protection failures,
@@ -42,6 +43,7 @@ from .state import StateStore
 from .strategy import ET
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+INFO = "INFO"                                 # listed for review; does not change the overall result
 ROUTINE_FLATTEN = "session flatten time"     # the reason bot.py gives the scheduled flatten
 DUPLICATE_START = "duplicate start rejected"  # bot.py's log line when the instance lock is held
 
@@ -186,6 +188,15 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
                 f"{i['tag']}: forward record missing {gaps}" if gaps else
                 f"{i['tag']}: {r['fill_qty']} @ {r['fill_price']} -> {r['exit_price']} ({r['exit_reason']}), "
                 f"net ${r['net_pnl']}, market drift {r.get('market_drift_ticks')} ticks")
+            # the paper broker ignores its fill minute's range (it can't know what came after the fill)
+            hi, lo, stop = r.get("entry_bar_high"), r.get("entry_bar_low"), r.get("stop_price")
+            if mode == "paper" and None not in (hi, lo, stop):
+                short = i["side"] == "short"
+                if (hi >= stop) if short else (lo <= stop):
+                    add("3 lifecycle", INFO,
+                        f"{i['tag']}: paper-uncertain: the entry minute's {'high' if short else 'low'} "
+                        f"{hi if short else lo} reached the stop {stop}; the paper broker can't tell whether "
+                        f"that happened after the fill")
 
     # 4. account guard
     g = AccountGuard(cfg.account, store)

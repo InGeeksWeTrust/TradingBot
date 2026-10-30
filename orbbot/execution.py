@@ -250,6 +250,7 @@ class ExecutionEngine:
         self.block_reasons: dict[str, str] = {}  # reason key -> text; any entry blocks new trades
         self.critical: list[str] = []
         self.last_closed: dict | None = None     # intent closed in the latest manage() call
+        self.on_transition = None                # optional callback(tag, new_state), logging only
 
     # ---------------- state machine
     def transition(self, intent: dict, new: S, detail: str = "", **fields) -> None:
@@ -260,6 +261,11 @@ class ExecutionEngine:
         intent["state"] = new.value
         intent.update(fields)
         log.info("Order %s: %s -> %s %s", intent["tag"], old.value, new.value, detail)
+        if self.on_transition is not None:      # latency instrumentation; must never affect the order
+            try:
+                self.on_transition(intent["tag"], new.value)
+            except Exception:  # noqa: BLE001
+                log.debug("on_transition hook failed", exc_info=True)
 
     def block(self, key: str, text: str) -> None:
         if key not in self.block_reasons:
