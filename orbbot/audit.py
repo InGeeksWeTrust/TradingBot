@@ -34,8 +34,9 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 from dataclasses import asdict
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from .config import BotConfig, load_config
@@ -371,17 +372,50 @@ def audit(cfg: BotConfig, day: date, mode: str = "paper", root: Path = Path(".")
     return overall, text
 
 
+def backup_blocked(cfg: BotConfig, now: datetime) -> str | None:
+    """Why the forward-test backup must not run now: during a weekday session (09:00 ET until 5 minutes
+    after the flatten time) the SQLite database and its -wal file may not be a consistent pair."""
+    et = now.astimezone(ET)
+    end = (datetime.combine(et.date(), cfg.strategy.flatten_time) + timedelta(minutes=5)).time()
+    if et.weekday() < 5 and time(9, 0) <= et.time() <= end:
+        return f"inside the session window (09:00-{end:%H:%M} ET)"
+    return None
+
+
+def run_backup(cfg: BotConfig, root: Path, now: datetime) -> None:
+    """Run backup-forward-test.ps1 (backups/<today>.zip). Never changes the audit's result."""
+    why = backup_blocked(cfg, now)
+    script = root / "backup-forward-test.ps1"
+    if why:
+        print(f"Backup skipped: {why}. Run it after the session: powershell -ExecutionPolicy Bypass -File {script.name}")
+        return
+    if not script.exists():
+        print(f"Backup skipped: {script} not found")
+        return
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                           capture_output=True, text=True, timeout=300)
+        print((r.stdout or "").strip() or f"Backup exited with code {r.returncode}")
+        if r.returncode != 0:
+            print(f"Backup FAILED (exit {r.returncode}): {(r.stderr or '').strip()[:500]}")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"Backup FAILED: {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Daily operational audit")
     ap.add_argument("--config", default="config-sweep.yaml")
     ap.add_argument("--date", help="YYYY-MM-DD (default: today, ET)")
     ap.add_argument("--mode", default="paper", choices=["paper", "live"])
+    ap.add_argument("--no-backup", action="store_true", help="don't run backup-forward-test.ps1 afterwards")
     a = ap.parse_args()
     cfg = load_config(a.config)
     day = date.fromisoformat(a.date) if a.date else datetime.now(ET).date()
     overall, text = audit(cfg, day, a.mode)
     print(text)
     print(f"Written to audit/{day}.md")
+    if not a.no_backup:
+        run_backup(cfg, Path("."), datetime.now(ET))
     raise SystemExit(0 if overall != FAIL else 1)
 
 

@@ -223,7 +223,16 @@ python -m orbbot.audit --config config-sweep.yaml
 It writes `audit\<date>.md` with PASS / WARN / FAIL for: state database vs paper account vs journal
 agreement, sweep levels used (including ones the ES filter blocked), each trade's full order lifecycle
 and forward record, the Maximum Loss Limit floor (and whether it is approximate), CRITICAL/flatten/
-crash events, and a fingerprint of the frozen settings (any change = FAIL).
+crash events, and a fingerprint of the frozen settings (any change = FAIL). It then backs up the record to
+`backups\<today>.zip` (`backup-forward-test.ps1`), unless run during the session window or with `--no-backup`.
+
+Forward-test report on the prospective sample only (read-only; writes `reports\forward_<date>.md`):
+```powershell
+python -m orbbot.forward_report --config config-sweep.yaml
+```
+Trades, refused signals, R statistics, drawdown and losing streak vs the pre-registered thresholds, the
+sequential z-test (no decision before 100 trades), execution drift and latency, account safety, and code
+and config versions. Practice drills stay in `python -m orbbot.drill --report`.
 
 Pre-registered dates (`forward_test:` in config-sweep.yaml): operational validation Oct 23 and Oct 26-29
 (5 sessions); the statistical sample starts **Monday 2026-11-02**. Nothing before that date is pooled

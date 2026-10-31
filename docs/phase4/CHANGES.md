@@ -2,6 +2,60 @@
 
 Every change to the forward engine or its records during Phase 4. Each entry says what changed, why, and whether it affects comparability with earlier forward records. The frozen strategy (signals, confirmation, stops, targets, sizing, risk limits, trading window, forward-test settings) has not changed. The audit's config fingerprint is still `a6f638a7dc88463a`.
 
+## Forward-test report and daily backup (2026-10-30)
+
+### 1. `python -m orbbot.forward_report`
+
+**What.** `python -m orbbot.forward_report --config config-sweep.yaml [--date D]` writes `reports/forward_<date>.md` (`orbbot/forward_report.py`). It opens `state/paper.sqlite` and `state-drill/drill.sqlite` read-only and reads `audit/*.md`.
+
+**Sample.**
+- Paper trades with session date from `forward_test.sample_start` (2026-11-02) to the report date, filled and closed.
+- Never included: operational-week trades, Practice-account drills (`python -m orbbot.drill --report` stays their separate record) and research results.
+- A filled trade that hasn't closed is shown but not counted.
+
+**Sections.**
+1. Trades; signals not traded, by reason; sessions run, and weekdays without a session start.
+   - The reasons are: filtered by ES confirmation, `stop_too_wide`, daily limits (`daily_headroom` or halted), stale (stale data, or a bot started after the signal), account guard, entry cutoff, and trade already open.
+   - A refusal recorded twice for the same signal (a restart replay) counts once.
+2. Net P&L; R per trade with mean and sd; win rate; profit factor. A per-trade table shows cumulative R.
+   - R = net P&L / planned stop risk (`planned_risk`, the plan's `risk_dollars`). This is the same definition research uses (`pnl / risk_usd`).
+3. Drawdown in R and $ (current and max, from a peak that starts at 0) and the longest losing streak (net P&L ≤ 0).
+   - These are set against the pre-registered thresholds: −20R / −26R over the first 100 trades, −26R / −34R over the first 200, and a streak of 12 / 15.
+   - The report says "REACHED" or "not reached" for each and draws no conclusion from it.
+4. The z of mean R (mean / (sd/√n)), against the pre-registered looks:
+   - at 100 trades, using the first 100: z ≥ 2.538 succeeds, otherwise continue;
+   - at 200 trades, using the first 200: z ≥ 1.662 succeeds, z ≤ −1.645 fails.
+   - Before 100 trades the current z is shown with "NO decision is made until a checkpoint."
+5. Execution, with drift and modeled slippage kept separate:
+   - Market drift, signal close → order sent: the price the bot saw in the poll that sent Order/place, from the latency log, against the signal price. Positive = worse.
+   - Modeled paper slippage, from the forward record.
+   - The Phase 4A **proposed monitoring flag** (mean drift > +11 ticks after 20+ trades with a measured drift). It is labelled as not a decision rule.
+   - Latency p50/p95, bar close → Order/place sent and signal recognized → sent.
+   - The forward record's `market_drift_ticks` (signal close → paper fill, which includes the seconds until the next poll fills) is listed for reference.
+6. Account safety:
+   - the rehearsed MLL floor, the latest end-of-day balance, and the headroom above the floor plus buffer;
+   - MLL guard blocks, halts and flattens (routine flatten-time ones counted separately), and safety events;
+   - each sample session's audit result with its WARN/FAIL/INFO rows (drill rows excluded); a session with no audit file is flagged;
+   - days whose end-of-day balance includes real drill P&L.
+7. Reproducibility:
+   - code versions from each session start, flagged if more than one or with uncommitted changes;
+   - the config fingerprint now against the frozen baseline;
+   - daily audits with a frozen-config FAIL.
+
+The thresholds are constants at the top of `orbbot/forward_report.py`, marked PRE-REGISTERED.
+
+**Comparability.** Reporting only. No signal, risk, sizing, config or pre-registered value changed; the fingerprint is still `a6f638a7dc88463a`.
+
+### 2. Backup at the end of the daily audit
+
+**What.**
+- `python -m orbbot.audit` now runs `backup-forward-test.ps1` after writing the audit, producing `backups/<today>.zip` (state/, journal/, audit/, logs/).
+- It is skipped, with a message, on a weekday between 09:00 ET and 5 minutes after the flatten time, so the SQLite file and its -wal stay a consistent pair.
+- `--no-backup` turns it off.
+- A failed backup is printed and never changes the audit's result or exit code.
+
+**Comparability.** None.
+
 ## Drill follow-ups: Auto OCO preflight, audit, wording, slippage report (2026-10-30)
 
 ### 1. Auto OCO Brackets preflight
