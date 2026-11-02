@@ -1,1 +1,16 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Forward-test record, drill record and daily audits (backed up by backup-forward-test.ps1, not git)
+state/
+state-drill/
+journal/
+journal-drill/
+logs/
+audit/
 backups/
+
+# Market data and exported account history
+data/*.dbn.zst
+research/history/
